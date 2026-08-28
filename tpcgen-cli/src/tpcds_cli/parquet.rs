@@ -1,5 +1,6 @@
 //! TPC-DS Parquet output.
 
+use super::generate::part_aware_path;
 use super::plan::TpcdsGenerationPlan;
 use crate::parquet::generate_parquet;
 use crate::progress::{ProgressHandle, ProgressTracker};
@@ -156,8 +157,11 @@ impl Parquet {
         let mut work: Vec<(Table, Session, TpcdsGenerationPlan, ProgressHandle)> = table_sessions
             .into_iter()
             .map(|(table, session)| {
-                let plan =
-                    TpcdsGenerationPlan::new(table, session.get_scaling(), self.row_group_bytes);
+                let plan = TpcdsGenerationPlan::new_for_range(
+                    table,
+                    self.row_group_bytes,
+                    session.get_source_row_range(table),
+                );
                 let progress = progress
                     .clone()
                     .register(table.get_name(), plan.row_group_count() as u64);
@@ -575,9 +579,6 @@ impl Parquet {
         R: RecordBatchReader + Send + 'static,
         F: Fn(Session, u64, u64) -> R + Send + 'static,
     {
-        let table_name = table.get_name();
-        let path = self.output_dir.join(format!("{table_name}.parquet"));
-
         // Keep only the encodings for columns on this table.
         // --column-encoding usually targets a few tables, not all of them.
         let column_encodings = self
@@ -585,6 +586,7 @@ impl Parquet {
             .as_ref()
             .map(|encodings| column_encodings_for_table(table, encodings));
 
+        let path = part_aware_path(&self.output_dir, table, "parquet", &session)?;
         let sources = plan
             .into_iter()
             .map(move |range| make_reader(session.clone(), *range.start(), *range.end()));
