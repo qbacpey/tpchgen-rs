@@ -17,16 +17,16 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Return the output path for `table`'s file, following `tpchgen-cli`'s
 /// `--parts`/`--part` naming convention: a single `<table>.<ext>` file when
-/// the session isn't split into chunks, otherwise
-/// `<table>/<table>.<chunk>.<ext>` (creating the per-table subdirectory as
-/// needed).
+/// `--parts` was not requested, otherwise `<table>/<table>.<chunk>.<ext>`
+/// (creating the per-table subdirectory as needed). `--parts 1` still
+/// nests, matching `tpchgen-cli`.
 pub(super) fn part_aware_path(
     output_dir: &Path,
     table: Table,
     ext: &str,
     session: &Session,
 ) -> io::Result<PathBuf> {
-    if session.get_total_chunks() > 1 {
+    if session.is_partitioned() {
         let dir = output_dir.join(table.get_name());
         std::fs::create_dir_all(&dir)?;
         Ok(dir.join(format!(

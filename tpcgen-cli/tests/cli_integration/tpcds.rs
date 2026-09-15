@@ -1584,6 +1584,37 @@ fn test_tpcgen_cli_tpcds_dat_parts_small_table_stays_in_chunk_one() {
     }
 }
 
+/// Test that `--parts 1` nests output the same way as any other part count
+/// (`reason/reason.1.dat`), matching `tpchgen-cli`; only the absence of
+/// `--parts` uses a flat, unnumbered file.
+#[test]
+fn test_tpcgen_cli_tpcds_dat_parts_one_matches_tpch_naming() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--parts")
+        .arg("1")
+        .assert()
+        .success();
+
+    assert!(
+        temp_dir.path().join("reason/reason.1.dat").is_file(),
+        "--parts 1 should nest like tpchgen-cli"
+    );
+    assert!(
+        !temp_dir.path().join("reason.dat").exists(),
+        "--parts 1 should not also produce a flat file"
+    );
+}
+
 /// Test that concatenating every `--parts` chunk of a DAT table, in order,
 /// reproduces exactly the unsplit single-file output (dsdgen's chunks are a
 /// position-independent partition of the same row sequence).

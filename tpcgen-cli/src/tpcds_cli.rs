@@ -25,6 +25,8 @@ pub mod parquet;
 mod plan;
 mod progress;
 
+use progress::share_across_parts;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 enum OutputFormat {
@@ -319,9 +321,9 @@ impl CommonArgs {
         let (progress, log_writer) = self.progress_tracker();
         configure_logging(self.verbose, self.quiet, log_writer);
 
-        std::fs::create_dir_all(&self.output_dir)?;
-
         let parts = self.part_list()?;
+
+        std::fs::create_dir_all(&self.output_dir)?;
 
         match output_format {
             // Parquet generates all tables in one call so that multiple
@@ -341,9 +343,15 @@ impl CommonArgs {
             OutputFormat::Dat(output) => {
                 let mut table_sessions = Vec::with_capacity(tables.len() * parts.len());
                 for table in &tables {
-                    for &part in &parts {
-                        let session = self.to_session(Some(table.get_name().to_string()), part)?;
-                        let progress = output.register_table(*table, &session, progress.clone());
+                    let sessions = parts
+                        .iter()
+                        .map(|&part| self.to_session(Some(table.get_name().to_string()), part))
+                        .collect::<Result<Vec<_>>>()?;
+                    // One bar per table, shared across all its parts.
+                    let table_progress =
+                        output.register_table(*table, &sessions[0], progress.clone());
+                    let part_progress = share_across_parts(table_progress, sessions.len());
+                    for (session, progress) in sessions.into_iter().zip(part_progress) {
                         table_sessions.push((*table, session, progress));
                     }
                 }
@@ -355,9 +363,15 @@ impl CommonArgs {
             OutputFormat::Csv(output) => {
                 let mut table_sessions = Vec::with_capacity(tables.len() * parts.len());
                 for table in &tables {
-                    for &part in &parts {
-                        let session = self.to_session(Some(table.get_name().to_string()), part)?;
-                        let progress = output.register_table(*table, &session, progress.clone());
+                    let sessions = parts
+                        .iter()
+                        .map(|&part| self.to_session(Some(table.get_name().to_string()), part))
+                        .collect::<Result<Vec<_>>>()?;
+                    // One bar per table, shared across all its parts.
+                    let table_progress =
+                        output.register_table(*table, &sessions[0], progress.clone());
+                    let part_progress = share_across_parts(table_progress, sessions.len());
+                    for (session, progress) in sessions.into_iter().zip(part_progress) {
                         table_sessions.push((*table, session, progress));
                     }
                 }
@@ -452,6 +466,7 @@ impl CommonArgs {
             .with_compat_mode(self.compat)
             .with_chunk_number(part.unwrap_or(1))
             .with_total_chunks(self.parts.unwrap_or(1))
+            .with_partitioned(self.parts.is_some())
             .with_command_line_arguments(command_line_arguments);
 
         if let Some(table) = table {

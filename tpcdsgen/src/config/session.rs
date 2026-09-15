@@ -4,19 +4,22 @@ use std::ops::RangeInclusive;
 
 /// Tables with fewer source rows than this are not split across chunks:
 /// chunk 1 generates the whole table and every other chunk generates none of
-/// it. Matches dsdgen's `tools/parallel.c` (`kRowsetSize` is only computed
-/// when `nTotalRows` is at least this many rows).
+/// it. Matches dsdgen's `tools/parallel.c` [1].
+///
+/// [1]: https://github.com/trinodb/tpcds/blob/b594136818cc95bd6b34a352327611b329017281/src/main/java/io/trino/tpcds/Parallel.java#L28
 const SMALL_TABLE_ROW_THRESHOLD: u64 = 1_000_000;
 
 /// Split `total_rows` into `total_chunks` pieces and return the 1-based
 /// `(first_row, row_count)` for `chunk_number`.
 ///
 /// Ports dsdgen's `split_work` (`tools/parallel.c`) / Trino's
-/// `Parallel.splitWork`: tables under [`SMALL_TABLE_ROW_THRESHOLD`] rows are
-/// generated entirely by chunk 1, with every other chunk getting zero rows.
-/// Otherwise rows are split evenly, with the remainder spread over the first
-/// chunks so every chunk's `first_row` lines up with a contiguous,
+/// `Parallel.splitWork` [1]: tables under [`SMALL_TABLE_ROW_THRESHOLD`] rows
+/// are generated entirely by chunk 1, with every other chunk getting zero
+/// rows. Otherwise rows are split evenly, with the remainder spread over the
+/// first chunks so every chunk's `first_row` lines up with a contiguous,
 /// non-overlapping partition of `1..=total_rows`.
+///
+/// [1]: https://github.com/trinodb/tpcds/blob/b594136818cc95bd6b34a352327611b329017281/src/main/java/io/trino/tpcds/Parallel.java#L24-L51
 fn split_work(total_rows: u64, chunk_number: i32, total_chunks: i32) -> (u64, u64) {
     if total_rows < SMALL_TABLE_ROW_THRESHOLD {
         return if chunk_number == 1 {
@@ -61,6 +64,7 @@ pub struct Session {
     no_sexism: bool,
     chunk_number: i32,
     total_chunks: i32,
+    partitioned: bool,
     compat_mode: CompatMode,
     command_line_arguments: Option<String>,
 }
@@ -73,6 +77,7 @@ impl Default for Session {
             no_sexism: Self::DEFAULT_NO_SEXISM,
             chunk_number: Self::DEFAULT_CHUNK_NUMBER,
             total_chunks: Self::DEFAULT_TOTAL_CHUNKS,
+            partitioned: Self::DEFAULT_PARTITIONED,
             compat_mode: Self::DEFAULT_COMPAT,
             command_line_arguments: None,
         }
@@ -84,6 +89,7 @@ impl Session {
     pub const DEFAULT_NO_SEXISM: bool = false;
     pub const DEFAULT_CHUNK_NUMBER: i32 = 1;
     pub const DEFAULT_TOTAL_CHUNKS: i32 = 1;
+    pub const DEFAULT_PARTITIONED: bool = false;
     pub const DEFAULT_COMPAT: CompatMode = CompatMode::Trino;
 
     /// Convert this session into a builder initialized with its current values.
@@ -94,6 +100,7 @@ impl Session {
             no_sexism: self.no_sexism,
             chunk_number: self.chunk_number,
             total_chunks: self.total_chunks,
+            partitioned: self.partitioned,
             compat_mode: self.compat_mode,
             command_line_arguments: self.command_line_arguments,
         }
@@ -142,13 +149,23 @@ impl Session {
         self.total_chunks
     }
 
+    /// Return `true` if `--parts` was requested, even for a single part
+    /// (`--parts 1`).
+    ///
+    /// Independent of [`Self::get_total_chunks`]: `--parts 1` and no
+    /// `--parts` both split into one chunk, but only the former should use
+    /// numbered, per-part output naming.
+    pub fn is_partitioned(&self) -> bool {
+        self.partitioned
+    }
+
     /// Return the 1-based, inclusive range of `table`'s source rows this
     /// session's chunk is responsible for generating.
     ///
-    /// Uses [`Table::source_table`] so a returns table (e.g.
-    /// [`Table::StoreReturns`]) is split using its sales table's row count,
-    /// matching how it is actually generated (paired with the sales
-    /// generator). An empty range is returned as `first_row..=(first_row - 1)`.
+    /// Works for every table, including a returns table (e.g.
+    /// [`Table::StoreReturns`]), which is split using its paired sales
+    /// table's row count via [`Table::source_table`]. An empty range is
+    /// returned as `first_row..=(first_row - 1)`.
     pub fn get_source_row_range(&self, table: Table) -> RangeInclusive<u64> {
         let total_rows = self.scaling.get_row_count(table.source_table());
         let (first_row, row_count) = split_work(total_rows, self.chunk_number, self.total_chunks);
@@ -174,6 +191,7 @@ pub struct SessionBuilder {
     no_sexism: bool,
     chunk_number: i32,
     total_chunks: i32,
+    partitioned: bool,
     compat_mode: CompatMode,
     command_line_arguments: Option<String>,
 }
@@ -186,6 +204,7 @@ impl Default for SessionBuilder {
             no_sexism: Session::DEFAULT_NO_SEXISM,
             chunk_number: Session::DEFAULT_CHUNK_NUMBER,
             total_chunks: Session::DEFAULT_TOTAL_CHUNKS,
+            partitioned: Session::DEFAULT_PARTITIONED,
             compat_mode: Session::DEFAULT_COMPAT,
             command_line_arguments: None,
         }
@@ -234,6 +253,12 @@ impl SessionBuilder {
         self
     }
 
+    /// Set whether `--parts` was requested. See [`Session::is_partitioned`].
+    pub fn with_partitioned(mut self, partitioned: bool) -> Self {
+        self.partitioned = partitioned;
+        self
+    }
+
     /// Set the reference implementation compatibility mode.
     pub fn with_compat_mode(mut self, compat_mode: CompatMode) -> Self {
         self.compat_mode = compat_mode;
@@ -265,6 +290,7 @@ impl SessionBuilder {
             no_sexism: self.no_sexism,
             chunk_number: self.chunk_number,
             total_chunks: self.total_chunks,
+            partitioned: self.partitioned,
             compat_mode: self.compat_mode,
             command_line_arguments: self.command_line_arguments,
         })
@@ -441,6 +467,25 @@ mod tests {
             .with_total_chunks(2)
             .build()
             .is_ok());
+    }
+
+    #[test]
+    fn test_partitioned_defaults_to_false() {
+        let session = Session::default();
+        assert!(!session.is_partitioned());
+    }
+
+    #[test]
+    fn test_partitioned_is_independent_of_total_chunks() {
+        // `--parts 1` (total_chunks == 1, partitioned == true) must be
+        // distinguishable from no `--parts` at all (also total_chunks == 1).
+        let session = SessionBuilder::new()
+            .with_total_chunks(1)
+            .with_partitioned(true)
+            .build()
+            .unwrap();
+        assert_eq!(session.get_total_chunks(), 1);
+        assert!(session.is_partitioned());
     }
 
     #[test]
