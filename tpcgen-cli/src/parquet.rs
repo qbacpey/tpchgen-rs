@@ -7,9 +7,12 @@ use log::debug;
 use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnChunk};
 use parquet::arrow::{add_encoded_arrow_schema_to_metadata, ArrowSchemaConverter};
 use parquet::basic::{Compression, Encoding};
-use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder, DEFAULT_COERCE_TYPES};
+use parquet::file::properties::{
+    WriterProperties, WriterPropertiesBuilder, WriterVersion, DEFAULT_COERCE_TYPES,
+};
 use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::types::SchemaDescPtr;
+use parquet::schema::types::{ColumnPath, SchemaDescPtr};
+use std::fmt;
 use std::io;
 use std::io::Write;
 use std::str::FromStr;
@@ -18,6 +21,58 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::progress::ProgressHandle;
 use crate::tpch_cli::statistics::WriteStatistics;
+
+/// Parquet format version to write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParquetVersion {
+    /// Parquet format version 1 (default, broader compatibility)
+    #[default]
+    V1,
+    /// Parquet format version 2 (Data Page V2)
+    V2,
+}
+
+impl ParquetVersion {
+    pub fn to_writer_version(self) -> WriterVersion {
+        match self {
+            ParquetVersion::V1 => WriterVersion::PARQUET_1_0,
+            ParquetVersion::V2 => WriterVersion::PARQUET_2_0,
+        }
+    }
+}
+
+/// Low-level writer settings passed to [`generate_parquet`].
+#[derive(Debug, Clone, Copy)]
+pub struct WriterPropertyOptions<'a> {
+    pub compression: Compression,
+    pub column_encodings: Option<&'a [(String, Encoding)]>,
+    pub uncompressed_column_overrides: &'a [String],
+    pub disable_dictionary_encoding_columns: &'a [String],
+    pub parquet_version: ParquetVersion,
+}
+
+impl FromStr for ParquetVersion {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "v1" | "1" | "1.0" => Ok(ParquetVersion::V1),
+            "v2" | "2" | "2.0" => Ok(ParquetVersion::V2),
+            _ => Err(format!(
+                "Invalid parquet version: {s}. Valid versions are: v1, v2"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for ParquetVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParquetVersion::V1 => write!(f, "v1"),
+            ParquetVersion::V2 => write!(f, "v2"),
+        }
+    }
+}
 
 pub trait IntoSize {
     /// Convert the object into a size
@@ -98,8 +153,7 @@ pub async fn generate_parquet<W, I>(
     writer: W,
     iter_iter: I,
     num_threads: usize,
-    parquet_compression: Compression,
-    column_encodings: Option<&[(String, Encoding)]>,
+    options: WriterPropertyOptions<'_>,
     progress: ProgressHandle,
 ) -> Result<(), io::Error>
 where
@@ -107,9 +161,8 @@ where
     I: Iterator + 'static,
     I::Item: RecordBatchReader + Send,
 {
-    debug!(
-        "Generating Parquet with {num_threads} threads, using {parquet_compression} compression"
-    );
+    let compression = options.compression;
+    debug!("Generating Parquet with {num_threads} threads, using {compression} compression");
     // Based on example in https://docs.rs/parquet/latest/parquet/arrow/arrow_writer/struct.ArrowColumnWriter.html
     let mut iter_iter = iter_iter.peekable();
     let Some(first_iter) = iter_iter.peek() else {
@@ -128,9 +181,19 @@ where
             .unwrap(),
     );
 
-    let mut builder = WriterProperties::builder().set_compression(parquet_compression);
-    if let Some(encodings) = column_encodings {
+    let mut builder = WriterProperties::builder()
+        .set_compression(options.compression)
+        .set_writer_version(options.parquet_version.to_writer_version());
+    if let Some(encodings) = options.column_encodings {
         builder = apply_column_encodings(builder, &parquet_schema, encodings)?;
+    }
+    for column in options.uncompressed_column_overrides {
+        builder = builder
+            .set_column_compression(ColumnPath::from(column.as_str()), Compression::UNCOMPRESSED);
+    }
+    for column in options.disable_dictionary_encoding_columns {
+        debug!("Disabling dictionary encoding for column {column}");
+        builder = builder.set_column_dictionary_enabled(ColumnPath::from(column.as_str()), false);
     }
     let mut writer_properties = builder.build();
     // Embed the Arrow schema in the Parquet metadata (as ArrowWriter does) so
@@ -308,8 +371,13 @@ mod tests {
             writer,
             vec![region_source(), region_source()].into_iter(),
             1,
-            Compression::UNCOMPRESSED,
-            None,
+            WriterPropertyOptions {
+                compression: Compression::UNCOMPRESSED,
+                column_encodings: None,
+                uncompressed_column_overrides: &[],
+                disable_dictionary_encoding_columns: &[],
+                parquet_version: ParquetVersion::V1,
+            },
             progress,
         )
         .await
@@ -331,11 +399,147 @@ mod tests {
             writer,
             vec![region_source()].into_iter(),
             1,
-            Compression::UNCOMPRESSED,
-            encodings,
+            WriterPropertyOptions {
+                compression: Compression::UNCOMPRESSED,
+                column_encodings: encodings,
+                uncompressed_column_overrides: &[],
+                disable_dictionary_encoding_columns: &[],
+                parquet_version: ParquetVersion::V1,
+            },
             progress,
         )
         .await
+    }
+
+    async fn write_region_with_uncompressed_columns(
+        uncompressed_columns: &[String],
+        output_path: &std::path::Path,
+    ) -> io::Result<()> {
+        let writer = BufWriter::new(File::create(output_path).unwrap());
+        let tracker = Arc::new(CountingProgress::default());
+        let progress: Arc<dyn ProgressTracker> = tracker;
+        let progress = progress.register("region", 1);
+        generate_parquet(
+            writer,
+            vec![region_source()].into_iter(),
+            1,
+            WriterPropertyOptions {
+                compression: Compression::SNAPPY,
+                column_encodings: None,
+                uncompressed_column_overrides: uncompressed_columns,
+                disable_dictionary_encoding_columns: &[],
+                parquet_version: ParquetVersion::V1,
+            },
+            progress,
+        )
+        .await
+    }
+
+    async fn write_region_with_disabled_dictionary(
+        disable_dictionary_columns: &[String],
+        output_path: &std::path::Path,
+    ) -> io::Result<()> {
+        let writer = BufWriter::new(File::create(output_path).unwrap());
+        let tracker = Arc::new(CountingProgress::default());
+        let progress: Arc<dyn ProgressTracker> = tracker;
+        let progress = progress.register("region", 1);
+        generate_parquet(
+            writer,
+            vec![region_source()].into_iter(),
+            1,
+            WriterPropertyOptions {
+                compression: Compression::SNAPPY,
+                column_encodings: None,
+                uncompressed_column_overrides: &[],
+                disable_dictionary_encoding_columns: disable_dictionary_columns,
+                parquet_version: ParquetVersion::V1,
+            },
+            progress,
+        )
+        .await
+    }
+
+    async fn write_region_with_version(
+        parquet_version: ParquetVersion,
+        output_path: &std::path::Path,
+    ) -> io::Result<()> {
+        let writer = BufWriter::new(File::create(output_path).unwrap());
+        let tracker = Arc::new(CountingProgress::default());
+        let progress: Arc<dyn ProgressTracker> = tracker;
+        let progress = progress.register("region", 1);
+        generate_parquet(
+            writer,
+            vec![region_source()].into_iter(),
+            1,
+            WriterPropertyOptions {
+                compression: Compression::SNAPPY,
+                column_encodings: None,
+                uncompressed_column_overrides: &[],
+                disable_dictionary_encoding_columns: &[],
+                parquet_version,
+            },
+            progress,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn parquet_version_v2_writes_version_2_files() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("v2.parquet");
+        write_region_with_version(ParquetVersion::V2, &output_path)
+            .await
+            .unwrap();
+
+        let file = File::open(&output_path).unwrap();
+        let mut metadata_reader = parquet::file::metadata::ParquetMetaDataReader::new();
+        metadata_reader.try_parse(&file).unwrap();
+        let metadata = metadata_reader.finish().unwrap();
+        assert_eq!(metadata.file_metadata().version(), 2);
+    }
+
+    #[tokio::test]
+    async fn uncompressed_column_overrides_set_column_compression() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("uncompressed.parquet");
+        write_region_with_uncompressed_columns(&[String::from("r_name")], &output_path)
+            .await
+            .unwrap();
+
+        let file = File::open(&output_path).unwrap();
+        let mut metadata_reader = parquet::file::metadata::ParquetMetaDataReader::new();
+        metadata_reader.try_parse(&file).unwrap();
+        let metadata = metadata_reader.finish().unwrap();
+        let row_group = metadata.row_groups().first().expect("row group");
+        let name_column = row_group
+            .columns()
+            .iter()
+            .find(|col| col.column_path().string() == "r_name")
+            .expect("r_name column");
+        assert_eq!(name_column.compression(), Compression::UNCOMPRESSED);
+    }
+
+    #[tokio::test]
+    async fn disable_dictionary_encoding_columns_disable_dictionary() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("no_dict.parquet");
+        write_region_with_disabled_dictionary(&[String::from("r_name")], &output_path)
+            .await
+            .unwrap();
+
+        let file = File::open(&output_path).unwrap();
+        let mut metadata_reader = parquet::file::metadata::ParquetMetaDataReader::new();
+        metadata_reader.try_parse(&file).unwrap();
+        let metadata = metadata_reader.finish().unwrap();
+        let row_group = metadata.row_groups().first().expect("row group");
+        let name_column = row_group
+            .columns()
+            .iter()
+            .find(|col| col.column_path().string() == "r_name")
+            .expect("r_name column");
+        let encodings: Vec<Encoding> = name_column.encodings().collect();
+        assert!(!encodings.contains(&Encoding::PLAIN_DICTIONARY));
+        assert!(!encodings.contains(&Encoding::RLE_DICTIONARY));
     }
 
     #[tokio::test]

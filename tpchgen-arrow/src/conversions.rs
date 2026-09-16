@@ -33,6 +33,15 @@ pub fn to_arrow_date32(value: TPCHDate) -> i32 {
     value.to_unix_epoch()
 }
 
+/// Convert a TPCH date to an Arrow Timestamp (milliseconds since Unix epoch).
+///
+/// Since TPCHDate represents a date (not time), we return midnight UTC on that date.
+#[inline(always)]
+pub fn to_arrow_timestamp_ms(value: TPCHDate) -> i64 {
+    const MILLIS_PER_DAY: i64 = 86_400_000;
+    value.to_unix_epoch() as i64 * MILLIS_PER_DAY
+}
+
 /// Converts an iterator of TPCH decimals to an Arrow Decimal128Array
 pub fn decimal128_array_from_iter<I>(values: I) -> arrow::array::Decimal128Array
 where

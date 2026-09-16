@@ -1,5 +1,5 @@
-use crate::DEFAULT_BATCH_SIZE;
-use arrow::array::{Int64Array, RecordBatch, StringViewArray};
+use crate::{ColumnTypeConfig, DEFAULT_BATCH_SIZE, KeyColumnType};
+use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -46,13 +46,23 @@ use tpchgen::generators::{NationGenerator, NationGeneratorIterator};
 pub struct NationArrow {
     inner: NationGeneratorIterator<'static>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    /// Cached schema based on column_type_config
+    schema: SchemaRef,
 }
 
 impl NationArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&NATION_SCHEMA)
+    }
+
     pub fn new(generator: NationGenerator<'static>) -> Self {
         Self {
             inner: generator.iter(),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&NATION_SCHEMA),
         }
     }
 
@@ -61,11 +71,22 @@ impl NationArrow {
         self.batch_size = batch_size;
         self
     }
+
+    /// Set column type configuration to customize column types.
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&NATION_SCHEMA)
+        } else {
+            make_nation_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for NationArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&NATION_SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -79,31 +100,59 @@ impl Iterator for NationArrow {
             return None;
         }
 
-        let n_nationkey = Int64Array::from_iter_values(rows.iter().map(|r| r.n_nationkey));
+        // Build n_nationkey based on config
+        let n_nationkey: ArrayRef = match self.column_type_config.nationkey_type {
+            KeyColumnType::I32 => Arc::new(Int32Array::from_iter_values(
+                rows.iter().map(|r| r.n_nationkey as i32),
+            )),
+            KeyColumnType::I64 => Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|r| r.n_nationkey),
+            )),
+        };
+
         let n_name = StringViewArray::from_iter_values(rows.iter().map(|r| r.n_name));
-        let n_regionkey = Int64Array::from_iter_values(rows.iter().map(|r| r.n_regionkey));
+
+        // Build n_regionkey based on config
+        let n_regionkey: ArrayRef = match self.column_type_config.regionkey_type {
+            KeyColumnType::I32 => Arc::new(Int32Array::from_iter_values(
+                rows.iter().map(|r| r.n_regionkey as i32),
+            )),
+            KeyColumnType::I64 => Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|r| r.n_regionkey),
+            )),
+        };
+
         let n_comment = StringViewArray::from_iter_values(rows.iter().map(|r| r.n_comment));
 
-        let batch = RecordBatch::try_new(
-            self.schema(),
+        Some(RecordBatch::try_new(
+            Arc::clone(&self.schema),
             vec![
-                Arc::new(n_nationkey),
+                n_nationkey,
                 Arc::new(n_name),
-                Arc::new(n_regionkey),
+                n_regionkey,
                 Arc::new(n_comment),
             ],
-        );
-        Some(batch)
+        ))
     }
 }
 
-/// Schema for the Nation
-static NATION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_nation_schema);
-fn make_nation_schema() -> SchemaRef {
+static NATION_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_nation_schema(&ColumnTypeConfig::default()));
+
+fn make_nation_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let nationkey_type = match config.nationkey_type {
+        KeyColumnType::I32 => DataType::Int32,
+        KeyColumnType::I64 => DataType::Int64,
+    };
+    let regionkey_type = match config.regionkey_type {
+        KeyColumnType::I32 => DataType::Int32,
+        KeyColumnType::I64 => DataType::Int64,
+    };
+
     Arc::new(Schema::new(vec![
-        Field::new("n_nationkey", DataType::Int64, false),
+        Field::new("n_nationkey", nationkey_type, false),
         Field::new("n_name", DataType::Utf8View, false),
-        Field::new("n_regionkey", DataType::Int64, false),
+        Field::new("n_regionkey", regionkey_type, false),
         Field::new("n_comment", DataType::Utf8View, false),
     ]))
 }

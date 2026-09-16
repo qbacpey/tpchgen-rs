@@ -1,8 +1,9 @@
 use crate::conversions::{
-    decimal_to_i128, is_null, julian_to_date32, opt, sk_opt, string_view_array_from_opt_iter,
+    date_array_from_opt_date32, date_arrow_type, decimal_array_from_opt_i128, decimal_arrow_type,
+    is_null, julian_to_date32, opt, sk_opt, string_view_array_from_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Date32Array, Decimal128Array, Int64Array, RecordBatch};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -13,14 +14,23 @@ use tpcdsgen::row::{GeneratedRow, ItemRowGenerator};
 pub struct ItemArrow {
     inner: RowIter<ItemRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl ItemArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&ITEM_SCHEMA)
+    }
+
     pub fn new(session: Session) -> Self {
         let row_count = session.get_scaling().get_row_count(Table::Item);
         Self {
             inner: RowIter::new(ItemRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&ITEM_SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: i64) {
@@ -45,11 +55,21 @@ impl ItemArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&ITEM_SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for ItemArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -97,8 +117,6 @@ impl Iterator for ItemArrow {
             let nbm = r.null_bit_map();
             i_sk.push(sk_opt(nbm, 0, r.get_i_item_sk()));
             i_id.push(opt(nbm, 1, r.get_i_item_id().to_owned()));
-            // IRecStartDateId is at bit 2 which CAN be set (not in not_null_bit_map);
-            // check the null bit first, then apply the julian-day < 0 sentinel.
             i_rec_start.push(if is_null(nbm, 2) {
                 None
             } else {
@@ -106,8 +124,16 @@ impl Iterator for ItemArrow {
             });
             i_rec_end.push(julian_to_date32(r.get_i_rec_end_date_id()));
             i_desc.push(opt(nbm, 4, r.get_i_item_desc().to_owned()));
-            i_current_price.push(opt(nbm, 5, decimal_to_i128(r.get_i_current_price())));
-            i_wholesale_cost.push(opt(nbm, 6, decimal_to_i128(r.get_i_wholesale_cost())));
+            i_current_price.push(opt(
+                nbm,
+                5,
+                crate::conversions::decimal_to_i128(r.get_i_current_price()),
+            ));
+            i_wholesale_cost.push(opt(
+                nbm,
+                6,
+                crate::conversions::decimal_to_i128(r.get_i_wholesale_cost()),
+            ));
             i_brand_id.push(opt(nbm, 7, r.get_i_brand_id()));
             i_brand.push(opt(nbm, 8, r.get_i_brand().to_owned()));
             i_class_id.push(opt(nbm, 9, r.get_i_class_id()));
@@ -125,27 +151,23 @@ impl Iterator for ItemArrow {
             i_product_name.push(opt(nbm, 21, r.get_i_product_name().to_owned()));
         }
 
-        let price_arr = Decimal128Array::from(i_current_price)
-            .with_precision_and_scale(38, 2)
-            .unwrap();
-        let wholesale_arr = Decimal128Array::from(i_wholesale_cost)
-            .with_precision_and_scale(38, 2)
-            .unwrap();
+        let decimal_type = self.column_type_config.decimal_type;
+        let date_type = self.column_type_config.date_type;
 
         let batch = RecordBatch::try_new(
-            self.schema(),
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(Int64Array::from(i_sk)),
                 Arc::new(string_view_array_from_opt_iter(
                     i_id.iter().map(|s| s.as_deref()),
                 )),
-                Arc::new(Date32Array::from(i_rec_start)),
-                Arc::new(Date32Array::from(i_rec_end)),
+                date_array_from_opt_date32(i_rec_start, date_type),
+                date_array_from_opt_date32(i_rec_end, date_type),
                 Arc::new(string_view_array_from_opt_iter(
                     i_desc.iter().map(|s| s.as_deref()),
                 )),
-                Arc::new(price_arr),
-                Arc::new(wholesale_arr),
+                decimal_array_from_opt_i128(i_current_price, decimal_type),
+                decimal_array_from_opt_i128(i_wholesale_cost, decimal_type),
                 Arc::new(Int64Array::from(i_brand_id)),
                 Arc::new(string_view_array_from_opt_iter(
                     i_brand.iter().map(|s| s.as_deref()),
@@ -187,17 +209,21 @@ impl Iterator for ItemArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static ITEM_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let decimal_type = decimal_arrow_type(config.decimal_type);
+    let date_type = date_arrow_type(config.date_type);
+
     Arc::new(Schema::new(vec![
         Field::new("i_item_sk", DataType::Int64, true),
         Field::new("i_item_id", DataType::Utf8View, true),
-        Field::new("i_rec_start_date", DataType::Date32, true),
-        Field::new("i_rec_end_date", DataType::Date32, true),
+        Field::new("i_rec_start_date", date_type.clone(), true),
+        Field::new("i_rec_end_date", date_type, true),
         Field::new("i_item_desc", DataType::Utf8View, true),
-        Field::new("i_current_price", DataType::Decimal128(38, 2), true),
-        Field::new("i_wholesale_cost", DataType::Decimal128(38, 2), true),
+        Field::new("i_current_price", decimal_type.clone(), true),
+        Field::new("i_wholesale_cost", decimal_type, true),
         Field::new("i_brand_id", DataType::Int64, true),
         Field::new("i_brand", DataType::Utf8View, true),
         Field::new("i_class_id", DataType::Int64, true),

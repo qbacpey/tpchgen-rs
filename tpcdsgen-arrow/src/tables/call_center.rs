@@ -1,9 +1,10 @@
 use crate::conversions::{
-    address_columns, decimal_to_i128, is_null, julian_to_date32, opt, sk_opt,
+    address_columns, date_array_from_opt_date32, date_arrow_type, decimal_array_from_opt_i128,
+    decimal_arrow_type, decimal_to_i128, is_null, julian_to_date32, opt, sk_opt,
     string_view_array_from_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Date32Array, Decimal128Array, Int32Array, Int64Array, RecordBatch};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -14,14 +15,23 @@ use tpcdsgen::row::{CallCenterRowGenerator, GeneratedRow};
 pub struct CallCenterArrow {
     inner: RowIter<CallCenterRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl CallCenterArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&CALL_CENTER_SCHEMA)
+    }
+
     pub fn new(session: Session) -> Self {
         let row_count = session.get_scaling().get_row_count(Table::CallCenter);
         Self {
             inner: RowIter::new(CallCenterRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&CALL_CENTER_SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: i64) {
@@ -46,11 +56,21 @@ impl CallCenterArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&CALL_CENTER_SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for CallCenterArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -142,19 +162,17 @@ impl Iterator for CallCenterArrow {
             gmt_offset,
         ) = address_columns(addr_rows.iter().map(|(a, nbm, base)| (a, *nbm, *base)));
 
-        let tax_arr = Decimal128Array::from(cc_tax_pct)
-            .with_precision_and_scale(38, 2)
-            .unwrap();
+        let tax_arr = decimal_array_from_opt_i128(cc_tax_pct, self.column_type_config.decimal_type);
 
         let batch = RecordBatch::try_new(
-            self.schema(),
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(Int64Array::from(cc_sk)),
                 Arc::new(string_view_array_from_opt_iter(
                     cc_id.iter().map(|s| s.as_deref()),
                 )),
-                Arc::new(Date32Array::from(cc_rec_start)),
-                Arc::new(Date32Array::from(cc_rec_end)),
+                date_array_from_opt_date32(cc_rec_start, self.column_type_config.date_type),
+                date_array_from_opt_date32(cc_rec_end, self.column_type_config.date_type),
                 Arc::new(Int64Array::from(cc_closed_date)),
                 Arc::new(Int64Array::from(cc_open_date)),
                 Arc::new(string_view_array_from_opt_iter(
@@ -199,21 +217,25 @@ impl Iterator for CallCenterArrow {
                 Arc::new(zip),
                 Arc::new(country),
                 Arc::new(gmt_offset),
-                Arc::new(tax_arr),
+                tax_arr,
             ],
         );
         Some(batch)
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static CALL_CENTER_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let decimal_type = decimal_arrow_type(config.decimal_type);
+    let date_type = date_arrow_type(config.date_type);
+
     Arc::new(Schema::new(vec![
         Field::new("cc_call_center_sk", DataType::Int64, true),
         Field::new("cc_call_center_id", DataType::Utf8View, true),
-        Field::new("cc_rec_start_date", DataType::Date32, true),
-        Field::new("cc_rec_end_date", DataType::Date32, true),
+        Field::new("cc_rec_start_date", date_type.clone(), true),
+        Field::new("cc_rec_end_date", date_type, true),
         Field::new("cc_closed_date_sk", DataType::Int64, true),
         Field::new("cc_open_date_sk", DataType::Int64, true),
         Field::new("cc_name", DataType::Utf8View, true),
@@ -240,6 +262,6 @@ fn make_schema() -> SchemaRef {
         Field::new("cc_zip", DataType::Utf8View, true),
         Field::new("cc_country", DataType::Utf8View, true),
         Field::new("cc_gmt_offset", DataType::Int32, true),
-        Field::new("cc_tax_percentage", DataType::Decimal128(38, 2), true),
+        Field::new("cc_tax_percentage", decimal_type, true),
     ]))
 }

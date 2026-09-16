@@ -4,6 +4,7 @@ use super::plan::DEFAULT_PARQUET_ROW_GROUP_BYTES;
 use super::runner::PlanRunner;
 use super::statistics::WriteStatistics;
 use crate::parquet::IntoSize;
+use crate::parquet::ParquetVersion;
 use crate::progress::{no_op_progress_tracker, ProgressTracker};
 pub use ::parquet::basic::{Compression, Encoding};
 use arrow::datatypes::SchemaRef;
@@ -23,8 +24,8 @@ use tpchgen::generators::{
 };
 use tpchgen::text::TextPool;
 use tpchgen_arrow::{
-    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow, RegionArrow,
-    SupplierArrow,
+    ColumnTypeConfig, CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow,
+    PartSuppArrow, RegionArrow, SupplierArrow,
 };
 
 /// Wrapper around a buffer writer that counts the number of buffers and bytes written
@@ -109,17 +110,22 @@ impl FromStr for Table {
     /// not support this since it just adds unnecessary complexity and confusion so we
     /// only support the exclusive abbreviations.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "n" | "nation" => Ok(Table::Nation),
-            "r" | "region" => Ok(Table::Region),
-            "s" | "supplier" => Ok(Table::Supplier),
-            "P" | "part" => Ok(Table::Part),
-            "S" | "partsupp" => Ok(Table::Partsupp),
-            "c" | "customer" => Ok(Table::Customer),
-            "O" | "orders" => Ok(Table::Orders),
-            "L" | "lineitem" => Ok(Table::Lineitem),
-            _ => Err("Invalid table name {s}"),
+        for (alias, table) in [
+            ("n", Table::Nation),
+            ("r", Table::Region),
+            ("s", Table::Supplier),
+            ("P", Table::Part),
+            ("S", Table::Partsupp),
+            ("c", Table::Customer),
+            ("O", Table::Orders),
+            ("L", Table::Lineitem),
+        ] {
+            if s == alias || s.eq_ignore_ascii_case(table.name()) {
+                return Ok(table);
+            }
         }
+
+        Err("Invalid table name {s}")
     }
 }
 
@@ -200,6 +206,14 @@ pub struct GeneratorConfig {
     pub parquet_compression: Compression,
     /// Per-column Parquet encodings (overrides writer defaults)
     pub parquet_column_encodings: Option<Vec<(String, Encoding)>>,
+    /// Columns that should use UNCOMPRESSED block compression
+    pub parquet_uncompressed_column_overrides: Vec<String>,
+    /// Columns that should not use dictionary encoding
+    pub parquet_disable_dictionary_encoding_columns: Vec<String>,
+    /// Parquet format version to write
+    pub parquet_version: ParquetVersion,
+    /// Arrow column type configuration for Parquet output
+    pub column_type_config: ColumnTypeConfig,
     /// Target row group size in bytes for Parquet files
     pub parquet_row_group_bytes: i64,
     /// Number of partitions to generate (if None, generates a single file per table)
@@ -222,6 +236,10 @@ impl Default for GeneratorConfig {
             num_threads: num_cpus::get(),
             parquet_compression: Compression::SNAPPY,
             parquet_column_encodings: None,
+            parquet_uncompressed_column_overrides: Vec::new(),
+            parquet_disable_dictionary_encoding_columns: Vec::new(),
+            parquet_version: ParquetVersion::default(),
+            column_type_config: ColumnTypeConfig::default(),
             parquet_row_group_bytes: DEFAULT_PARQUET_ROW_GROUP_BYTES,
             parts: None,
             part: None,
@@ -357,6 +375,11 @@ impl TpchGenerator {
             ParquetWriterOptions {
                 compression: config.parquet_compression,
                 column_encodings: config.parquet_column_encodings,
+                uncompressed_column_overrides: config.parquet_uncompressed_column_overrides,
+                disable_dictionary_encoding_columns: config
+                    .parquet_disable_dictionary_encoding_columns,
+                parquet_version: config.parquet_version,
+                column_type_config: config.column_type_config,
             },
             config.parquet_row_group_bytes,
             config.stdout,
@@ -440,6 +463,33 @@ impl TpchGeneratorBuilder {
         encodings: Option<Vec<(String, Encoding)>>,
     ) -> Self {
         self.config.parquet_column_encodings = encodings;
+        self
+    }
+
+    /// Set columns that should use UNCOMPRESSED block compression.
+    pub fn with_parquet_uncompressed_column_overrides(mut self, columns: Vec<String>) -> Self {
+        self.config.parquet_uncompressed_column_overrides = columns;
+        self
+    }
+
+    /// Set columns that should not use dictionary encoding.
+    pub fn with_parquet_disable_dictionary_encoding_columns(
+        mut self,
+        columns: Vec<String>,
+    ) -> Self {
+        self.config.parquet_disable_dictionary_encoding_columns = columns;
+        self
+    }
+
+    /// Set the Parquet format version to write (default: v1).
+    pub fn with_parquet_version(mut self, version: ParquetVersion) -> Self {
+        self.config.parquet_version = version;
+        self
+    }
+
+    /// Set Arrow column type configuration for Parquet output.
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.config.column_type_config = config;
         self
     }
 

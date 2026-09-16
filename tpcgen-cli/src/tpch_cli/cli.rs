@@ -2,8 +2,9 @@ use super::{
     Compression, Encoding, OutputFormat, Table, TpchGenerator, TpchGeneratorBuilder,
     DEFAULT_PARQUET_ROW_GROUP_BYTES,
 };
+use crate::args::parse_row_group_bytes;
 use crate::logging::configure_logging;
-use crate::parquet::parse_column_encoding_pair;
+use crate::parquet::{parse_column_encoding_pair, ParquetVersion};
 #[cfg(feature = "indicatif-progress")]
 use crate::progress::IndicatifProgress;
 use clap::builder::TypedValueParser;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 #[cfg(feature = "indicatif-progress")]
 use std::sync::Arc;
+use tpchgen_arrow::{ColumnTypeConfig, DateColumnType, DecimalColumnType, KeyColumnType};
 
 #[derive(Parser)]
 #[command(name = "tpchgen")]
@@ -238,7 +240,7 @@ struct ParquetArgs {
     #[arg(short = 'c', long, default_value = "SNAPPY")]
     compression: Compression,
 
-    /// Target size in row group bytes in Parquet files
+    /// Target row-group size in bytes
     ///
     /// Row groups are the typical unit of parallel processing and compression
     /// with many query engines. Therefore, smaller row groups enable better
@@ -250,7 +252,11 @@ struct ParquetArgs {
     /// groups under this limit.
     ///
     /// Typical values range from 10MB to 100MB.
-    #[arg(long, default_value_t = DEFAULT_PARQUET_ROW_GROUP_BYTES)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PARQUET_ROW_GROUP_BYTES,
+        value_parser = parse_row_group_bytes
+    )]
     row_group_bytes: i64,
 
     /// Per-column Parquet encodings (overrides writer defaults).
@@ -269,6 +275,69 @@ struct ParquetArgs {
     /// through this flag, and BIT_PACKED is not supported for writing.
     #[arg(long, value_delimiter = ',', value_parser = parse_column_encoding_pair)]
     column_encoding: Option<Vec<(String, Encoding)>>,
+    /// Columns that should use UNCOMPRESSED block compression.
+    ///
+    /// Format: comma or space separated list of column names.
+    ///
+    /// Example: `--uncompressed-column-overrides=l_comment,l_shipinstruct`
+    #[arg(short, long, num_args = 0.., value_delimiter = ',')]
+    uncompressed_column_overrides: Vec<String>,
+    /// Disable dictionary encoding for specific columns.
+    ///
+    /// Format: comma or space separated list of column names.
+    ///
+    /// Example: `--disable-dictionary-encoding=c_name,l_comment`
+    #[arg(long = "disable-dictionary-encoding", num_args = 0.., value_delimiter = ',')]
+    disable_dictionary_encoding_columns: Vec<String>,
+    /// Parquet format version to write.
+    ///
+    /// Version 1 (default) has broader compatibility. Version 2 uses Data Page V2
+    /// format with improved encodings. Ensure downstream tools support version 2
+    /// before enabling.
+    ///
+    /// Valid values: v1 (default), v2
+    #[arg(long, default_value = "v1", value_parser = clap::value_parser!(ParquetVersion))]
+    parquet_version: ParquetVersion,
+    /// Type to use for decimal/monetary columns.
+    ///
+    /// Valid values: decimal128 (default), f64
+    #[arg(
+        long,
+        default_value = "decimal128",
+        value_parser = clap::value_parser!(DecimalColumnType),
+        help_heading = "TPC-H column types"
+    )]
+    decimal_column_type: DecimalColumnType,
+    /// Type to use for date columns.
+    ///
+    /// Valid values: date32 (default), timestamp_ms
+    #[arg(
+        long,
+        default_value = "date32",
+        value_parser = clap::value_parser!(DateColumnType),
+        help_heading = "TPC-H column types"
+    )]
+    date_column_type: DateColumnType,
+    /// Type to use for nationkey columns.
+    ///
+    /// Valid values: i64 (default), i32
+    #[arg(
+        long,
+        default_value = "i64",
+        value_parser = clap::value_parser!(KeyColumnType),
+        help_heading = "TPC-H column types"
+    )]
+    nationkey_type: KeyColumnType,
+    /// Type to use for regionkey columns.
+    ///
+    /// Valid values: i64 (default), i32
+    #[arg(
+        long,
+        default_value = "i64",
+        value_parser = clap::value_parser!(KeyColumnType),
+        help_heading = "TPC-H column types"
+    )]
+    regionkey_type: KeyColumnType,
 }
 
 /// Parse a delimiter string, handling escape sequences.
@@ -317,11 +386,25 @@ impl TypedValueParser for TableValueParser {
         _: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
+        let to_err = |msg: String| {
+            clap::Error::raw(clap::error::ErrorKind::InvalidValue, format!("{msg}\n")).with_cmd(cmd)
+        };
+
         let value = value
             .to_str()
-            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd))?;
-        Table::from_str(value)
-            .map_err(|_| clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd))
+            .ok_or_else(|| to_err("table names must be valid UTF-8".to_string()))?;
+
+        Table::from_str(value).map_err(|_| {
+            let expected = self
+                .possible_values()
+                .expect("table parser defines possible values")
+                .map(|table| table.get_name().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            to_err(format!(
+                "unknown table '{value}'. Expected one of: {expected}"
+            ))
+        })
     }
 
     fn possible_values(
@@ -392,6 +475,17 @@ impl ParquetArgs {
             .with_parquet_compression(self.compression)
             .with_parquet_row_group_bytes(self.row_group_bytes)
             .with_parquet_column_encodings(self.column_encoding)
+            .with_parquet_uncompressed_column_overrides(self.uncompressed_column_overrides)
+            .with_parquet_disable_dictionary_encoding_columns(
+                self.disable_dictionary_encoding_columns,
+            )
+            .with_parquet_version(self.parquet_version)
+            .with_column_type_config(ColumnTypeConfig {
+                decimal_type: self.decimal_column_type,
+                date_type: self.date_column_type,
+                nationkey_type: self.nationkey_type,
+                regionkey_type: self.regionkey_type,
+            })
             .build()
             .generate()
             .await

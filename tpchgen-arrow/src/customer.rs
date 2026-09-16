@@ -1,6 +1,6 @@
-use crate::DEFAULT_BATCH_SIZE;
 use crate::conversions::{decimal128_array_from_iter, string_view_array_from_display_iter};
-use arrow::array::{Int64Array, RecordBatch};
+use crate::{ColumnTypeConfig, DEFAULT_BATCH_SIZE, DecimalColumnType, KeyColumnType};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -47,13 +47,23 @@ use tpchgen::generators::{CustomerGenerator, CustomerGeneratorIterator};
 pub struct CustomerArrow {
     inner: CustomerGeneratorIterator<'static>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    /// Cached schema based on column_type_config
+    schema: SchemaRef,
 }
 
 impl CustomerArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&CUSTOMER_SCHEMA)
+    }
+
     pub fn new(generator: CustomerGenerator<'static>) -> Self {
         Self {
             inner: generator.iter(),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&CUSTOMER_SCHEMA),
         }
     }
 
@@ -62,11 +72,22 @@ impl CustomerArrow {
         self.batch_size = batch_size;
         self
     }
+
+    /// Set column type configuration to customize column types.
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&CUSTOMER_SCHEMA)
+        } else {
+            make_customer_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for CustomerArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&CUSTOMER_SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -83,39 +104,68 @@ impl Iterator for CustomerArrow {
         let c_custkey = Int64Array::from_iter_values(rows.iter().map(|r| r.c_custkey));
         let c_name = string_view_array_from_display_iter(rows.iter().map(|r| r.c_name));
         let c_address = string_view_array_from_display_iter(rows.iter().map(|r| &r.c_address));
-        let c_nationkey = Int64Array::from_iter_values(rows.iter().map(|r| r.c_nationkey));
+
+        // Build c_nationkey based on config
+        let c_nationkey: ArrayRef = match self.column_type_config.nationkey_type {
+            KeyColumnType::I32 => Arc::new(Int32Array::from_iter_values(
+                rows.iter().map(|r| r.c_nationkey as i32),
+            )),
+            KeyColumnType::I64 => Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|r| r.c_nationkey),
+            )),
+        };
+
         let c_phone = string_view_array_from_display_iter(rows.iter().map(|r| &r.c_phone));
-        let c_acctbal = decimal128_array_from_iter(rows.iter().map(|r| r.c_acctbal));
+
+        // Build c_acctbal based on config
+        let c_acctbal: ArrayRef = match self.column_type_config.decimal_type {
+            DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|r| r.c_acctbal.as_f64()),
+            )),
+            DecimalColumnType::Decimal128 => {
+                Arc::new(decimal128_array_from_iter(rows.iter().map(|r| r.c_acctbal)))
+            }
+        };
+
         let c_mktsegment = string_view_array_from_display_iter(rows.iter().map(|r| r.c_mktsegment));
         let c_comment = string_view_array_from_display_iter(rows.iter().map(|r| r.c_comment));
 
-        let batch = RecordBatch::try_new(
-            self.schema(),
+        Some(RecordBatch::try_new(
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(c_custkey),
                 Arc::new(c_name),
                 Arc::new(c_address),
-                Arc::new(c_nationkey),
+                c_nationkey,
                 Arc::new(c_phone),
-                Arc::new(c_acctbal),
+                c_acctbal,
                 Arc::new(c_mktsegment),
                 Arc::new(c_comment),
             ],
-        );
-        Some(batch)
+        ))
     }
 }
 
-/// Schema for the Customer
-static CUSTOMER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_customer_schema);
-fn make_customer_schema() -> SchemaRef {
+static CUSTOMER_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_customer_schema(&ColumnTypeConfig::default()));
+
+fn make_customer_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let nationkey_type = match config.nationkey_type {
+        KeyColumnType::I32 => DataType::Int32,
+        KeyColumnType::I64 => DataType::Int64,
+    };
+    let acctbal_type = match config.decimal_type {
+        DecimalColumnType::F64 => DataType::Float64,
+        DecimalColumnType::Decimal128 => DataType::Decimal128(15, 2),
+    };
+
     Arc::new(Schema::new(vec![
         Field::new("c_custkey", DataType::Int64, false),
         Field::new("c_name", DataType::Utf8View, false),
         Field::new("c_address", DataType::Utf8View, false),
-        Field::new("c_nationkey", DataType::Int64, false),
+        Field::new("c_nationkey", nationkey_type, false),
         Field::new("c_phone", DataType::Utf8View, false),
-        Field::new("c_acctbal", DataType::Decimal128(15, 2), false),
+        Field::new("c_acctbal", acctbal_type, false),
         Field::new("c_mktsegment", DataType::Utf8View, false),
         Field::new("c_comment", DataType::Utf8View, false),
     ]))

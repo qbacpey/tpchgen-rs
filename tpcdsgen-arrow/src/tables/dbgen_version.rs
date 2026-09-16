@@ -1,6 +1,9 @@
-use crate::conversions::{date_to_date32, opt, string_view_array_from_opt_iter};
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Date32Array, RecordBatch, Time32SecondArray};
+use crate::conversions::{
+    date_array_from_opt_date32, date_arrow_type, date_to_date32, opt,
+    string_view_array_from_opt_iter,
+};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{RecordBatch, Time32SecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -11,14 +14,23 @@ use tpcdsgen::row::{DbgenVersionRowGenerator, GeneratedRow};
 pub struct DbgenVersionArrow {
     inner: RowIter<DbgenVersionRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl DbgenVersionArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&DBGEN_VERSION_SCHEMA)
+    }
+
     pub fn new(session: Session) -> Self {
         let row_count = session.get_scaling().get_row_count(Table::DbgenVersion);
         Self {
             inner: RowIter::new(DbgenVersionRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&DBGEN_VERSION_SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: i64) {
@@ -43,11 +55,21 @@ impl DbgenVersionArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&DBGEN_VERSION_SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for DbgenVersionArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -82,12 +104,12 @@ impl Iterator for DbgenVersionArrow {
         }
 
         let batch = RecordBatch::try_new(
-            self.schema(),
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(string_view_array_from_opt_iter(
                     version.iter().map(|s| s.as_deref()),
                 )),
-                Arc::new(Date32Array::from(create_date)),
+                date_array_from_opt_date32(create_date, self.column_type_config.date_type),
                 Arc::new(Time32SecondArray::from(create_time)),
                 Arc::new(string_view_array_from_opt_iter(
                     cmdline.iter().map(|s| s.as_deref()),
@@ -98,12 +120,15 @@ impl Iterator for DbgenVersionArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static DBGEN_VERSION_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let date_type = date_arrow_type(config.date_type);
+
     Arc::new(Schema::new(vec![
         Field::new("dv_version", DataType::Utf8View, true),
-        Field::new("dv_create_date", DataType::Date32, true),
+        Field::new("dv_create_date", date_type, true),
         Field::new("dv_create_time", DataType::Time32(TimeUnit::Second), true),
         Field::new("dv_cmdline_args", DataType::Utf8View, true),
     ]))

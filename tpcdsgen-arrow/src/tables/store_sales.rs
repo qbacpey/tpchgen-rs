@@ -1,6 +1,8 @@
-use crate::conversions::{decimal_to_i128, opt, sk_opt};
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Decimal128Array, Int32Array, Int64Array, RecordBatch};
+use crate::conversions::{
+    decimal_array_from_opt_i128, decimal_arrow_type, decimal_to_i128, opt, sk_opt,
+};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -11,14 +13,23 @@ use tpcdsgen::row::{GeneratedRow, StoreSalesRowGenerator};
 pub struct StoreSalesArrow {
     inner: RowIter<StoreSalesRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl StoreSalesArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&STORE_SALES_SCHEMA)
+    }
+
     pub fn new(session: Session) -> Self {
         let row_count = session.get_scaling().get_row_count(Table::StoreSales);
         Self {
             inner: RowIter::new(StoreSalesRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&STORE_SALES_SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: i64) {
@@ -43,11 +54,21 @@ impl StoreSalesArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&STORE_SALES_SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for StoreSalesArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -129,13 +150,10 @@ impl Iterator for StoreSalesArrow {
             ss_net_profit.push(opt(nbm, 21, decimal_to_i128(p.get_net_profit())));
         }
 
-        let dec = |v: Vec<Option<i128>>| {
-            Decimal128Array::from(v)
-                .with_precision_and_scale(38, 2)
-                .unwrap()
-        };
+        let decimal_type = self.column_type_config.decimal_type;
+        let dec = |v: Vec<Option<i128>>| decimal_array_from_opt_i128(v, decimal_type);
         let batch = RecordBatch::try_new(
-            self.schema(),
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(Int64Array::from(ss_sold_date)),
                 Arc::new(Int64Array::from(ss_sold_time)),
@@ -148,27 +166,30 @@ impl Iterator for StoreSalesArrow {
                 Arc::new(Int64Array::from(ss_promo)),
                 Arc::new(Int64Array::from(ss_ticket)),
                 Arc::new(Int32Array::from(ss_quantity)),
-                Arc::new(dec(ss_wholesale_cost)),
-                Arc::new(dec(ss_list_price)),
-                Arc::new(dec(ss_sales_price)),
-                Arc::new(dec(ss_ext_discount_amt)),
-                Arc::new(dec(ss_ext_sales_price)),
-                Arc::new(dec(ss_ext_wholesale_cost)),
-                Arc::new(dec(ss_ext_list_price)),
-                Arc::new(dec(ss_ext_tax)),
-                Arc::new(dec(ss_coupon_amt)),
-                Arc::new(dec(ss_net_paid)),
-                Arc::new(dec(ss_net_paid_inc_tax)),
-                Arc::new(dec(ss_net_profit)),
+                dec(ss_wholesale_cost),
+                dec(ss_list_price),
+                dec(ss_sales_price),
+                dec(ss_ext_discount_amt),
+                dec(ss_ext_sales_price),
+                dec(ss_ext_wholesale_cost),
+                dec(ss_ext_list_price),
+                dec(ss_ext_tax),
+                dec(ss_coupon_amt),
+                dec(ss_net_paid),
+                dec(ss_net_paid_inc_tax),
+                dec(ss_net_profit),
             ],
         );
         Some(batch)
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static STORE_SALES_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let decimal_type = decimal_arrow_type(config.decimal_type);
+
     Arc::new(Schema::new(vec![
         Field::new("ss_sold_date_sk", DataType::Int64, true),
         Field::new("ss_sold_time_sk", DataType::Int64, true),
@@ -181,17 +202,17 @@ fn make_schema() -> SchemaRef {
         Field::new("ss_promo_sk", DataType::Int64, true),
         Field::new("ss_ticket_number", DataType::Int64, true),
         Field::new("ss_quantity", DataType::Int32, true),
-        Field::new("ss_wholesale_cost", DataType::Decimal128(38, 2), true),
-        Field::new("ss_list_price", DataType::Decimal128(38, 2), true),
-        Field::new("ss_sales_price", DataType::Decimal128(38, 2), true),
-        Field::new("ss_ext_discount_amt", DataType::Decimal128(38, 2), true),
-        Field::new("ss_ext_sales_price", DataType::Decimal128(38, 2), true),
-        Field::new("ss_ext_wholesale_cost", DataType::Decimal128(38, 2), true),
-        Field::new("ss_ext_list_price", DataType::Decimal128(38, 2), true),
-        Field::new("ss_ext_tax", DataType::Decimal128(38, 2), true),
-        Field::new("ss_coupon_amt", DataType::Decimal128(38, 2), true),
-        Field::new("ss_net_paid", DataType::Decimal128(38, 2), true),
-        Field::new("ss_net_paid_inc_tax", DataType::Decimal128(38, 2), true),
-        Field::new("ss_net_profit", DataType::Decimal128(38, 2), true),
+        Field::new("ss_wholesale_cost", decimal_type.clone(), true),
+        Field::new("ss_list_price", decimal_type.clone(), true),
+        Field::new("ss_sales_price", decimal_type.clone(), true),
+        Field::new("ss_ext_discount_amt", decimal_type.clone(), true),
+        Field::new("ss_ext_sales_price", decimal_type.clone(), true),
+        Field::new("ss_ext_wholesale_cost", decimal_type.clone(), true),
+        Field::new("ss_ext_list_price", decimal_type.clone(), true),
+        Field::new("ss_ext_tax", decimal_type.clone(), true),
+        Field::new("ss_coupon_amt", decimal_type.clone(), true),
+        Field::new("ss_net_paid", decimal_type.clone(), true),
+        Field::new("ss_net_paid_inc_tax", decimal_type.clone(), true),
+        Field::new("ss_net_profit", decimal_type, true),
     ]))
 }

@@ -1,8 +1,9 @@
 use crate::conversions::{
-    bool_to_yn, decimal_to_i128, opt, sk_opt, string_view_array_from_opt_iter,
+    bool_to_yn, decimal_array_from_opt_i128, decimal_arrow_type, decimal_to_i128, opt, sk_opt,
+    string_view_array_from_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Decimal128Array, Int32Array, Int64Array, RecordBatch};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -13,14 +14,23 @@ use tpcdsgen::row::{GeneratedRow, PromotionRowGenerator};
 pub struct PromotionArrow {
     inner: RowIter<PromotionRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl PromotionArrow {
+    /// Return the schema without initializing a data generator.
+    pub fn schema_ref() -> SchemaRef {
+        Arc::clone(&PROMOTION_SCHEMA)
+    }
+
     pub fn new(session: Session) -> Self {
         let row_count = session.get_scaling().get_row_count(Table::Promotion);
         Self {
             inner: RowIter::new(PromotionRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&PROMOTION_SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: i64) {
@@ -45,11 +55,21 @@ impl PromotionArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&PROMOTION_SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for PromotionArrow {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&SCHEMA)
+        Arc::clone(&self.schema)
     }
 }
 
@@ -121,11 +141,9 @@ impl Iterator for PromotionArrow {
             ));
         }
 
-        let cost_arr = Decimal128Array::from(p_cost)
-            .with_precision_and_scale(38, 2)
-            .unwrap();
+        let cost_arr = decimal_array_from_opt_i128(p_cost, self.column_type_config.decimal_type);
         let batch = RecordBatch::try_new(
-            self.schema(),
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(Int64Array::from(p_sk)),
                 Arc::new(string_view_array_from_opt_iter(
@@ -134,7 +152,7 @@ impl Iterator for PromotionArrow {
                 Arc::new(Int64Array::from(p_start)),
                 Arc::new(Int64Array::from(p_end)),
                 Arc::new(Int64Array::from(p_item)),
-                Arc::new(cost_arr),
+                cost_arr,
                 Arc::new(Int32Array::from(p_response)),
                 Arc::new(string_view_array_from_opt_iter(
                     p_name.iter().map(|s| s.as_deref()),
@@ -178,16 +196,19 @@ impl Iterator for PromotionArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static PROMOTION_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
+    let decimal_type = decimal_arrow_type(config.decimal_type);
+
     Arc::new(Schema::new(vec![
         Field::new("p_promo_sk", DataType::Int64, true),
         Field::new("p_promo_id", DataType::Utf8View, true),
         Field::new("p_start_date_sk", DataType::Int64, true),
         Field::new("p_end_date_sk", DataType::Int64, true),
         Field::new("p_item_sk", DataType::Int64, true),
-        Field::new("p_cost", DataType::Decimal128(38, 2), true),
+        Field::new("p_cost", decimal_type, true),
         Field::new("p_response_target", DataType::Int32, true),
         Field::new("p_promo_name", DataType::Utf8View, true),
         Field::new("p_channel_dmail", DataType::Utf8View, true),

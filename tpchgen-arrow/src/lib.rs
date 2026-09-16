@@ -1,7 +1,7 @@
 //! Generate TPCH data as Arrow RecordBatches
 //!
 //! This crate provides generators for TPCH tables that directly produces
-//! Arrow [`RecordBatch`](arrow::array::RecordBatch)es. This is significantly faster than generating TBL or CSV
+//! Arrow [`arrow::array::RecordBatch`]es. This is significantly faster than generating TBL or CSV
 //! files and then parsing them into Arrow.
 //!
 //! # Example
@@ -34,6 +34,10 @@
 //!   "+------------+-----------+-----------+--------------+------------+-----------------+------------+-------+--------------+--------------+------------+--------------+---------------+-------------------+------------+-------------------------------------+"
 //! ]);
 //! ```
+
+use std::fmt;
+use std::str::FromStr;
+
 pub mod conversions;
 mod customer;
 mod lineitem;
@@ -54,4 +58,141 @@ pub use region::RegionArrow;
 pub use supplier::SupplierArrow;
 
 /// The default number of rows in each Batch
-pub const DEFAULT_BATCH_SIZE: usize = 8 * 1000;
+pub const DEFAULT_BATCH_SIZE: usize = 8_000;
+
+/// Type to use for decimal/monetary columns.
+///
+/// Controls the Arrow type for columns like c_acctbal, l_quantity, l_extendedprice,
+/// l_discount, l_tax, o_totalprice, p_retailprice, ps_supplycost, s_acctbal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecimalColumnType {
+    #[default]
+    Decimal128,
+    F64,
+}
+
+impl fmt::Display for DecimalColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecimalColumnType::Decimal128 => write!(f, "decimal128"),
+            DecimalColumnType::F64 => write!(f, "f64"),
+        }
+    }
+}
+
+impl FromStr for DecimalColumnType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "decimal128" => Ok(DecimalColumnType::Decimal128),
+            "f64" => Ok(DecimalColumnType::F64),
+            _ => Err(format!(
+                "Invalid decimal column type: '{}'. Valid values are: decimal128, f64",
+                s
+            )),
+        }
+    }
+}
+
+/// Type to use for date columns.
+///
+/// Controls the Arrow type for columns like l_shipdate, l_commitdate, l_receiptdate, o_orderdate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DateColumnType {
+    /// Use Date32 for date columns (default)
+    #[default]
+    Date32,
+    /// Use Timestamp(Millisecond, None) for date columns
+    TimestampMs,
+}
+
+impl fmt::Display for DateColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DateColumnType::Date32 => write!(f, "date32"),
+            DateColumnType::TimestampMs => write!(f, "timestamp_ms"),
+        }
+    }
+}
+
+impl FromStr for DateColumnType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "date32" => Ok(DateColumnType::Date32),
+            "timestamp_ms" => Ok(DateColumnType::TimestampMs),
+            _ => Err(format!(
+                "Invalid date column type: '{}'. Valid values are: date32, timestamp_ms",
+                s
+            )),
+        }
+    }
+}
+
+/// Type to use for nation and region key columns.
+///
+/// These tables do not scale with the scale factor, and so
+/// can fit in an Int32.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyColumnType {
+    #[default]
+    I64,
+    I32,
+}
+
+impl fmt::Display for KeyColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyColumnType::I64 => write!(f, "i64"),
+            KeyColumnType::I32 => write!(f, "i32"),
+        }
+    }
+}
+
+impl FromStr for KeyColumnType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "i64" => Ok(KeyColumnType::I64),
+            "i32" => Ok(KeyColumnType::I32),
+            _ => Err(format!(
+                "Invalid key column type: '{}'. Valid values are: i64, i32",
+                s
+            )),
+        }
+    }
+}
+
+/// Configuration for column types in generated Arrow data.
+///
+/// This allows customizing the Arrow types used for specific column categories:
+/// - Decimal columns (monetary values like prices, account balances)
+/// - Date columns (order dates, ship dates, etc.)
+/// - Nation key columns (foreign keys to nation table)
+/// - Region key columns (foreign keys to region table)
+///
+/// # Example
+/// ```
+/// use tpchgen_arrow::{ColumnTypeConfig, DateColumnType, DecimalColumnType, KeyColumnType};
+///
+/// let config = ColumnTypeConfig {
+///     decimal_type: DecimalColumnType::F64,
+///     date_type: DateColumnType::TimestampMs,
+///     nationkey_type: KeyColumnType::I32,
+///     regionkey_type: KeyColumnType::I32,
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColumnTypeConfig {
+    /// Type for decimal/monetary columns
+    pub decimal_type: DecimalColumnType,
+    /// Type for date columns (l_shipdate, l_commitdate, l_receiptdate, o_orderdate)
+    pub date_type: DateColumnType,
+    /// Type for nationkey columns (c_nationkey, n_nationkey, s_nationkey)
+    pub nationkey_type: KeyColumnType,
+    /// Type for regionkey columns (n_regionkey, r_regionkey)
+    pub regionkey_type: KeyColumnType,
+}

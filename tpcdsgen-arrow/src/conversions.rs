@@ -1,6 +1,12 @@
 //! Routines to convert TPC-DS types to Arrow types
 
-use arrow::array::{Decimal128Array, Int32Array, StringViewArray, StringViewBuilder};
+use crate::{DateColumnType, DecimalColumnType};
+use arrow::array::{
+    ArrayRef, Date32Array, Decimal128Array, Float64Array, Int32Array, StringViewArray,
+    StringViewBuilder, TimestampMillisecondArray,
+};
+use arrow::datatypes::{DataType, TimeUnit};
+use std::sync::Arc;
 use tpcdsgen::types::{Address, Date, Decimal};
 
 /// Julian day number for the Unix epoch (1970-01-01)
@@ -45,6 +51,52 @@ where
     Decimal128Array::from_iter_values(values)
         .with_precision_and_scale(38, 2)
         .unwrap()
+}
+
+/// Arrow type for monetary columns under `config`.
+pub fn decimal_arrow_type(decimal_type: DecimalColumnType) -> DataType {
+    match decimal_type {
+        DecimalColumnType::Decimal128 => DataType::Decimal128(38, 2),
+        DecimalColumnType::F64 => DataType::Float64,
+    }
+}
+
+/// Arrow type for date columns under `config`.
+pub fn date_arrow_type(date_type: DateColumnType) -> DataType {
+    match date_type {
+        DateColumnType::Date32 => DataType::Date32,
+        DateColumnType::TimestampMs => DataType::Timestamp(TimeUnit::Millisecond, None),
+    }
+}
+
+/// Build a nullable decimal column array from unscaled cent values.
+pub fn decimal_array_from_opt_i128(
+    values: Vec<Option<i128>>,
+    decimal_type: DecimalColumnType,
+) -> ArrayRef {
+    match decimal_type {
+        DecimalColumnType::Decimal128 => Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(38, 2)
+                .unwrap(),
+        ),
+        DecimalColumnType::F64 => Arc::new(Float64Array::from_iter(
+            values.iter().map(|v| v.map(|c| c as f64 / 100.0)),
+        )),
+    }
+}
+
+/// Build a nullable date column array from Date32 day offsets.
+pub fn date_array_from_opt_date32(values: Vec<Option<i32>>, date_type: DateColumnType) -> ArrayRef {
+    const MILLIS_PER_DAY: i64 = 86_400_000;
+    match date_type {
+        DateColumnType::Date32 => Arc::new(Date32Array::from(values)),
+        DateColumnType::TimestampMs => Arc::new(TimestampMillisecondArray::from_iter(
+            values
+                .iter()
+                .map(|d| d.map(|days| days as i64 * MILLIS_PER_DAY)),
+        )),
+    }
 }
 
 /// Build a Decimal128Array from an iterator of optional TPC-DS Decimals (nullable).

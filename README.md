@@ -6,6 +6,12 @@
 > The project is now maintained at
 > [`datafusion-contrib/tpcgen-rs`](https://github.com/datafusion-contrib/tpcgen-rs).
 
+> [!NOTE]
+> This branch adds a Dockerfile, container CI, and helper scripts for
+> downstream Parquet generation. See [scripts/README.md](scripts/README.md)
+> for details. The Docker `ENTRYPOINT` (`scripts/generate_tpch.py`) is updated
+> in a later commit once the ported CLI flags land.
+
 [![Apache licensed][license-badge]][license-url]
 [![Build Status][actions-badge]][actions-url]
 

@@ -18,6 +18,8 @@ project details
 [Datafusion
 blog](https://datafusion.apache.org/blog/2025/04/10/fastest-tpch-generator/) to learn about the project's history
 * Try it yourself by following the instructions below
+* For Docker-based generation with downstream Parquet tuning, see
+  [scripts/README.md](../scripts/README.md) in the repository root
 
 ## Try with `uvx`
 
