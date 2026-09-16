@@ -1,7 +1,7 @@
 //! TPC-DS data generation CLI with a dbgen compatible API.
 use crate::args::parse_row_group_bytes;
 use crate::logging::configure_logging;
-use crate::parquet::parse_column_encoding_pair;
+use crate::parquet::{parse_column_encoding_pair, ParquetVersion};
 #[cfg(feature = "indicatif-progress")]
 use crate::progress::IndicatifProgress;
 use crate::progress::{no_op_progress_tracker, ProgressTracker};
@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tpcdsgen::config::{CompatMode, Session, SessionBuilder, Table};
 use tpcdsgen::error::TpcdsError;
+use tpcdsgen_arrow::{ColumnTypeConfig, DateColumnType, DecimalColumnType};
 
 pub mod csv;
 pub mod dat;
@@ -139,6 +140,42 @@ struct ParquetArgs {
     /// through this flag, and BIT_PACKED is not supported for writing.
     #[arg(long, value_delimiter = ',', value_parser = parse_column_encoding_pair)]
     column_encoding: Option<Vec<(String, Encoding)>>,
+    /// Columns that should use UNCOMPRESSED block compression.
+    ///
+    /// Format: comma or space separated list of column names.
+    ///
+    /// Example: `--uncompressed-column-overrides=r_reason_desc`
+    #[arg(short, long, num_args = 0.., value_delimiter = ',')]
+    uncompressed_column_overrides: Vec<String>,
+    /// Disable dictionary encoding for specific columns.
+    ///
+    /// Format: comma or space separated list of column names.
+    ///
+    /// Example: `--disable-dictionary-encoding=r_reason_desc`
+    #[arg(long = "disable-dictionary-encoding", num_args = 0.., value_delimiter = ',')]
+    disable_dictionary_encoding_columns: Vec<String>,
+    /// Parquet format version to write.
+    ///
+    /// Version 1 (default) has broader compatibility. Version 2 uses Data Page V2
+    /// format with improved encodings. Ensure downstream tools support version 2
+    /// before enabling.
+    ///
+    /// Valid values: v1 (default), v2
+    #[arg(long, default_value = "v1", value_parser = clap::value_parser!(ParquetVersion))]
+    parquet_version: ParquetVersion,
+    /// Type to use for decimal/monetary columns.
+    ///
+    /// Valid values: decimal128 (default), f64
+    ///
+    /// TPC-DS decimals are `Decimal128(38, 2)`. Generated values fit exactly in
+    /// `f64`, but the declared precision exceeds what `f64` represents exactly.
+    #[arg(long, default_value = "decimal128", value_parser = clap::value_parser!(DecimalColumnType))]
+    decimal_column_type: DecimalColumnType,
+    /// Type to use for date columns.
+    ///
+    /// Valid values: date32 (default), timestamp_ms
+    #[arg(long, default_value = "date32", value_parser = clap::value_parser!(DateColumnType))]
+    date_column_type: DateColumnType,
 }
 
 #[derive(Args)]
@@ -208,6 +245,13 @@ impl ParquetArgs {
                 self.row_group_bytes,
                 self.num_threads,
                 self.column_encoding,
+                self.uncompressed_column_overrides,
+                self.disable_dictionary_encoding_columns,
+                self.parquet_version,
+                ColumnTypeConfig {
+                    decimal_type: self.decimal_column_type,
+                    date_type: self.date_column_type,
+                },
             )
             .await
     }
@@ -221,12 +265,17 @@ impl CommonArgs {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_parquet(
         self,
         compression: Compression,
         row_group_bytes: i64,
         num_threads: usize,
         column_encoding: Option<Vec<(String, Encoding)>>,
+        uncompressed_column_overrides: Vec<String>,
+        disable_dictionary_encoding_columns: Vec<String>,
+        parquet_version: ParquetVersion,
+        column_type_config: ColumnTypeConfig,
     ) -> Result<()> {
         let output = parquet::Parquet::new(
             self.output_dir.clone(),
@@ -234,6 +283,10 @@ impl CommonArgs {
             row_group_bytes,
             num_threads,
             column_encoding,
+            uncompressed_column_overrides,
+            disable_dictionary_encoding_columns,
+            parquet_version,
+            column_type_config,
         );
         self.run_output(OutputFormat::Parquet(output)).await
     }

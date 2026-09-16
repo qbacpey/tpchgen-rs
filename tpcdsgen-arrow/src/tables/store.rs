@@ -1,9 +1,10 @@
 use crate::conversions::{
-    address_columns, decimal128_5_2_array, decimal_to_i128, integer_opt, integer_sk_opt,
-    julian_to_date32, opt, string_view_array_from_opt_iter,
+    address_columns, date_array, date_arrow_type, decimal_array, decimal_array_as,
+    decimal_arrow_type, decimal_to_i128, integer_opt, integer_sk_opt, julian_to_date32, opt,
+    string_view_array_from_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Date32Array, Int32Array, RecordBatch};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -14,6 +15,8 @@ use tpcdsgen::row::{GeneratedRow, StoreRowGenerator};
 pub struct StoreArrow {
     inner: RowIter<StoreRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl StoreArrow {
@@ -27,6 +30,8 @@ impl StoreArrow {
         Self {
             inner: RowIter::new(StoreRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -51,11 +56,21 @@ impl StoreArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for StoreArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -135,7 +150,7 @@ impl Iterator for StoreArrow {
             gmt_offset,
         ) = address_columns(addr_rows.iter().map(|(a, nbm, base)| (a, *nbm, *base)));
 
-        let tax_arr = decimal128_5_2_array(s_tax_pct);
+        let tax_arr = decimal_array(s_tax_pct, self.column_type_config.decimal_type, 5);
 
         let batch = RecordBatch::try_new(
             self.schema(),
@@ -144,8 +159,8 @@ impl Iterator for StoreArrow {
                 Arc::new(string_view_array_from_opt_iter(
                     s_id.iter().map(|s| s.as_deref()),
                 )),
-                Arc::new(Date32Array::from(s_rec_start)),
-                Arc::new(Date32Array::from(s_rec_end)),
+                date_array(s_rec_start, self.column_type_config.date_type),
+                date_array(s_rec_end, self.column_type_config.date_type),
                 Arc::new(Int32Array::from(s_closed_date)),
                 Arc::new(string_view_array_from_opt_iter(
                     s_name.iter().map(|s| s.as_deref()),
@@ -185,7 +200,7 @@ impl Iterator for StoreArrow {
                 Arc::new(state),
                 Arc::new(zip),
                 Arc::new(country),
-                Arc::new(gmt_offset),
+                decimal_array_as(gmt_offset, self.column_type_config.decimal_type),
                 Arc::new(tax_arr),
             ],
         );
@@ -193,14 +208,14 @@ impl Iterator for StoreArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("s_store_sk", DataType::Int32, false),
         Field::new("s_store_id", DataType::Utf8View, false),
-        Field::new("s_rec_start_date", DataType::Date32, true),
-        Field::new("s_rec_end_date", DataType::Date32, true),
+        Field::new("s_rec_start_date", date_arrow_type(config.date_type), true),
+        Field::new("s_rec_end_date", date_arrow_type(config.date_type), true),
         Field::new("s_closed_date_sk", DataType::Int32, true),
         Field::new("s_store_name", DataType::Utf8View, true),
         Field::new("s_number_employees", DataType::Int32, true),
@@ -224,7 +239,15 @@ fn make_schema() -> SchemaRef {
         Field::new("s_state", DataType::Utf8View, true),
         Field::new("s_zip", DataType::Utf8View, true),
         Field::new("s_country", DataType::Utf8View, true),
-        Field::new("s_gmt_offset", DataType::Decimal128(5, 2), true),
-        Field::new("s_tax_precentage", DataType::Decimal128(5, 2), true),
+        Field::new(
+            "s_gmt_offset",
+            decimal_arrow_type(config.decimal_type, 5),
+            true,
+        ),
+        Field::new(
+            "s_tax_precentage",
+            decimal_arrow_type(config.decimal_type, 5),
+            true,
+        ),
     ]))
 }

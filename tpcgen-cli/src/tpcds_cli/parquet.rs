@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tpcdsgen::config::{Session, Table};
 use tpcdsgen_arrow::{
-    CallCenterArrow, CatalogPageArrow, CatalogReturnsArrow, CatalogSalesArrow,
+    CallCenterArrow, CatalogPageArrow, CatalogReturnsArrow, CatalogSalesArrow, ColumnTypeConfig,
     CustomerAddressArrow, CustomerArrow, CustomerDemographicsArrow, DateDimArrow,
     DbgenVersionArrow, HouseholdDemographicsArrow, IncomeBandArrow, InventoryArrow, ItemArrow,
     PromotionArrow, ReasonArrow, ShipModeArrow, StoreArrow, StoreReturnsArrow, StoreSalesArrow,
@@ -89,7 +89,7 @@ fn column_encodings_for_table(
         .collect()
 }
 
-/// Parquet output generator.
+/// Parquet writer settings for TPC-DS output.
 #[derive(Debug, Clone)]
 pub(super) struct Parquet {
     output_dir: PathBuf,
@@ -97,15 +97,24 @@ pub(super) struct Parquet {
     row_group_bytes: i64,
     num_threads: usize,
     column_encodings: Option<Vec<(String, Encoding)>>,
+    uncompressed_column_overrides: Vec<String>,
+    disable_dictionary_encoding_columns: Vec<String>,
+    parquet_version: crate::parquet::ParquetVersion,
+    column_type_config: ColumnTypeConfig,
 }
 
 impl Parquet {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         output_dir: PathBuf,
         compression: Compression,
         row_group_bytes: i64,
         num_threads: usize,
         column_encodings: Option<Vec<(String, Encoding)>>,
+        uncompressed_column_overrides: Vec<String>,
+        disable_dictionary_encoding_columns: Vec<String>,
+        parquet_version: crate::parquet::ParquetVersion,
+        column_type_config: ColumnTypeConfig,
     ) -> Self {
         Self {
             output_dir,
@@ -113,6 +122,10 @@ impl Parquet {
             row_group_bytes,
             num_threads,
             column_encodings,
+            uncompressed_column_overrides,
+            disable_dictionary_encoding_columns,
+            parquet_version,
+            column_type_config,
         }
     }
 
@@ -181,6 +194,7 @@ impl Parquet {
         num_threads: usize,
         progress: ProgressHandle,
     ) -> io::Result<()> {
+        let column_type_config = self.column_type_config;
         match table {
             Table::CallCenter => {
                 self.write_table(
@@ -189,8 +203,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        CallCenterArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        CallCenterArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -202,7 +218,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         CatalogPageArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -215,8 +231,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        CatalogReturnsArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        CatalogReturnsArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -228,8 +246,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        CatalogSalesArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        CatalogSalesArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -241,7 +261,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         CustomerArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -254,7 +274,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         CustomerAddressArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -267,7 +287,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         CustomerDemographicsArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -280,8 +300,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        DateDimArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        DateDimArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -293,8 +315,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        DbgenVersionArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        DbgenVersionArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -306,7 +330,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         HouseholdDemographicsArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -319,7 +343,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         IncomeBandArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -332,7 +356,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         InventoryArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -345,7 +369,11 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| ItemArrow::new(session).with_source_row_range(start, end),
+                    move |session, start, end| {
+                        ItemArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
+                    },
                 )
                 .await
             }
@@ -356,8 +384,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        PromotionArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        PromotionArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -369,7 +399,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         ReasonArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -382,7 +412,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         ShipModeArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -395,8 +425,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        StoreArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        StoreArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -408,8 +440,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        StoreReturnsArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        StoreReturnsArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -421,8 +455,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        StoreSalesArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        StoreSalesArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -434,7 +470,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         TimeDimArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -447,7 +483,7 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
+                    move |session, start, end| {
                         WarehouseArrow::new(session).with_source_row_range(start, end)
                     },
                 )
@@ -460,8 +496,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        WebPageArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        WebPageArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -473,8 +511,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        WebReturnsArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        WebReturnsArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -486,8 +526,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        WebSalesArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        WebSalesArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -499,8 +541,10 @@ impl Parquet {
                     plan,
                     num_threads,
                     progress,
-                    |session, start, end| {
-                        WebSiteArrow::new(session).with_source_row_range(start, end)
+                    move |session, start, end| {
+                        WebSiteArrow::new(session)
+                            .with_column_type_config(column_type_config)
+                            .with_source_row_range(start, end)
                     },
                 )
                 .await
@@ -556,9 +600,9 @@ impl Parquet {
             num_threads,
             self.compression,
             column_encodings.as_deref(),
-            &[],
-            &[],
-            crate::parquet::ParquetVersion::default(),
+            &self.uncompressed_column_overrides,
+            &self.disable_dictionary_encoding_columns,
+            self.parquet_version,
             progress.clone(),
         )
         .await?;

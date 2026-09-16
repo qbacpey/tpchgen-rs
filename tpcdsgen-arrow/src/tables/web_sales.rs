@@ -1,5 +1,5 @@
-use crate::conversions::{decimal128_7_2_array, decimal_to_i128, integer_sk_opt, opt};
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
+use crate::conversions::{decimal_array, decimal_arrow_type, decimal_to_i128, integer_sk_opt, opt};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
 use arrow::array::{Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -11,6 +11,8 @@ use tpcdsgen::row::{GeneratedRow, WebSalesRowGenerator};
 pub struct WebSalesArrow {
     inner: RowIter<WebSalesRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl WebSalesArrow {
@@ -24,6 +26,8 @@ impl WebSalesArrow {
         Self {
             inner: RowIter::new(WebSalesRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -48,11 +52,21 @@ impl WebSalesArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for WebSalesArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -162,7 +176,8 @@ impl Iterator for WebSalesArrow {
             ws_net_profit.push(opt(nbm, 33, decimal_to_i128(p.get_net_profit())));
         }
 
-        let dec = decimal128_7_2_array;
+        let decimal_type = self.column_type_config.decimal_type;
+        let dec = |values| decimal_array(values, decimal_type, 7);
         let batch = RecordBatch::try_new(
             self.schema(),
             vec![
@@ -206,9 +221,9 @@ impl Iterator for WebSalesArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("ws_sold_date_sk", DataType::Int32, true),
         Field::new("ws_sold_time_sk", DataType::Int32, true),
@@ -229,20 +244,80 @@ fn make_schema() -> SchemaRef {
         Field::new("ws_promo_sk", DataType::Int32, true),
         Field::new("ws_order_number", DataType::Int64, false),
         Field::new("ws_quantity", DataType::Int32, true),
-        Field::new("ws_wholesale_cost", DataType::Decimal128(7, 2), true),
-        Field::new("ws_list_price", DataType::Decimal128(7, 2), true),
-        Field::new("ws_sales_price", DataType::Decimal128(7, 2), true),
-        Field::new("ws_ext_discount_amt", DataType::Decimal128(7, 2), true),
-        Field::new("ws_ext_sales_price", DataType::Decimal128(7, 2), true),
-        Field::new("ws_ext_wholesale_cost", DataType::Decimal128(7, 2), true),
-        Field::new("ws_ext_list_price", DataType::Decimal128(7, 2), true),
-        Field::new("ws_ext_tax", DataType::Decimal128(7, 2), true),
-        Field::new("ws_coupon_amt", DataType::Decimal128(7, 2), true),
-        Field::new("ws_ext_ship_cost", DataType::Decimal128(7, 2), true),
-        Field::new("ws_net_paid", DataType::Decimal128(7, 2), true),
-        Field::new("ws_net_paid_inc_tax", DataType::Decimal128(7, 2), true),
-        Field::new("ws_net_paid_inc_ship", DataType::Decimal128(7, 2), true),
-        Field::new("ws_net_paid_inc_ship_tax", DataType::Decimal128(7, 2), true),
-        Field::new("ws_net_profit", DataType::Decimal128(7, 2), true),
+        Field::new(
+            "ws_wholesale_cost",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_list_price",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_sales_price",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_ext_discount_amt",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_ext_sales_price",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_ext_wholesale_cost",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_ext_list_price",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_ext_tax",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_coupon_amt",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_ext_ship_cost",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_net_paid",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_net_paid_inc_tax",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_net_paid_inc_ship",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_net_paid_inc_ship_tax",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "ws_net_profit",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
     ]))
 }

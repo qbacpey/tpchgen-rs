@@ -1,8 +1,9 @@
 use crate::conversions::{
-    bool_to_yn, integer_sk_opt, julian_to_date32, opt, string_view_array_from_opt_iter,
+    bool_to_yn, date_array, date_arrow_type, integer_sk_opt, julian_to_date32, opt,
+    string_view_array_from_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
-use arrow::array::{Date32Array, Int32Array, RecordBatch};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
+use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
@@ -13,6 +14,8 @@ use tpcdsgen::row::{GeneratedRow, WebPageRowGenerator};
 pub struct WebPageArrow {
     inner: RowIter<WebPageRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl WebPageArrow {
@@ -26,6 +29,8 @@ impl WebPageArrow {
         Self {
             inner: RowIter::new(WebPageRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -50,11 +55,21 @@ impl WebPageArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for WebPageArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -115,8 +130,8 @@ impl Iterator for WebPageArrow {
                 Arc::new(string_view_array_from_opt_iter(
                     wp_id.iter().map(|s| s.as_deref()),
                 )),
-                Arc::new(Date32Array::from(wp_rec_start)),
-                Arc::new(Date32Array::from(wp_rec_end)),
+                date_array(wp_rec_start, self.column_type_config.date_type),
+                date_array(wp_rec_end, self.column_type_config.date_type),
                 Arc::new(Int32Array::from(wp_creation_date)),
                 Arc::new(Int32Array::from(wp_access_date)),
                 Arc::new(string_view_array_from_opt_iter(wp_autogen.iter().copied())),
@@ -137,14 +152,14 @@ impl Iterator for WebPageArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("wp_web_page_sk", DataType::Int32, false),
         Field::new("wp_web_page_id", DataType::Utf8View, false),
-        Field::new("wp_rec_start_date", DataType::Date32, true),
-        Field::new("wp_rec_end_date", DataType::Date32, true),
+        Field::new("wp_rec_start_date", date_arrow_type(config.date_type), true),
+        Field::new("wp_rec_end_date", date_arrow_type(config.date_type), true),
         Field::new("wp_creation_date_sk", DataType::Int32, true),
         Field::new("wp_access_date_sk", DataType::Int32, true),
         Field::new("wp_autogen_flag", DataType::Utf8View, true),

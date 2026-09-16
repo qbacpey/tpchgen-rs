@@ -1,5 +1,8 @@
-use crate::conversions::{address_columns, integer_sk_opt, opt, string_view_array_from_opt_iter};
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
+use crate::conversions::{
+    address_columns, decimal_array_as, decimal_arrow_type, integer_sk_opt, opt,
+    string_view_array_from_opt_iter,
+};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -11,6 +14,8 @@ use tpcdsgen::row::{GeneratedRow, WarehouseRowGenerator};
 pub struct WarehouseArrow {
     inner: RowIter<WarehouseRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl WarehouseArrow {
@@ -24,6 +29,8 @@ impl WarehouseArrow {
         Self {
             inner: RowIter::new(WarehouseRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -48,11 +55,21 @@ impl WarehouseArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for WarehouseArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -122,16 +139,16 @@ impl Iterator for WarehouseArrow {
                 Arc::new(state),
                 Arc::new(zip),
                 Arc::new(country),
-                Arc::new(gmt_offset),
+                decimal_array_as(gmt_offset, self.column_type_config.decimal_type),
             ],
         );
         Some(batch)
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("w_warehouse_sk", DataType::Int32, false),
         Field::new("w_warehouse_id", DataType::Utf8View, false),
@@ -146,6 +163,10 @@ fn make_schema() -> SchemaRef {
         Field::new("w_state", DataType::Utf8View, true),
         Field::new("w_zip", DataType::Utf8View, true),
         Field::new("w_country", DataType::Utf8View, true),
-        Field::new("w_gmt_offset", DataType::Decimal128(5, 2), true),
+        Field::new(
+            "w_gmt_offset",
+            decimal_arrow_type(config.decimal_type, 5),
+            true,
+        ),
     ]))
 }

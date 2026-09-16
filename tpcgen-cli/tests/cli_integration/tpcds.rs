@@ -1,4 +1,18 @@
-use super::test_helpers::{expect_column_encoding, expect_row_group_sizes, RowGroups};
+//! TPC-DS CLI integration tests.
+//!
+//! Fork-only Parquet flags are mirrored from TPC-H where applicable:
+//! - `tpch_parquet_uncompressed_column_overrides` -> `tpcds_parquet_uncompressed_column_overrides`
+//! - `tpch_parquet_disable_dictionary_encoding` -> `tpcds_parquet_disable_dictionary_encoding`
+//! - `tpch_parquet_version_v2` -> `tpcds_parquet_version_v2`
+//! - `tpch_parquet_decimal_column_type_f64` -> `tpcds_parquet_decimal_column_type_f64`
+//! - `tpch_parquet_date_column_type_timestamp_ms` -> `tpcds_parquet_date_column_type_timestamp_ms`
+//!
+//! Allowlisted as TPC-H-only: `--nationkey-type`, `--regionkey-type` (no nation/region tables in TPC-DS).
+
+use super::test_helpers::{
+    expect_column_arrow_type, expect_column_compression, expect_column_encoding,
+    expect_column_encoding_absent, expect_parquet_file_version, expect_row_group_sizes, RowGroups,
+};
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, TimeUnit};
@@ -238,6 +252,264 @@ fn test_tpcgen_cli_tpcds_parquet_compression() {
             assert_eq!(column.compression(), Compression::UNCOMPRESSED);
         }
     }
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_uncompressed_column_overrides() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--uncompressed-column-overrides")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_column_compression(&path, "r_reason_desc", Compression::UNCOMPRESSED);
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_disable_dictionary_encoding() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--disable-dictionary-encoding")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_column_encoding_absent(&path, "r_reason_desc", Encoding::PLAIN_DICTIONARY);
+    expect_column_encoding_absent(&path, "r_reason_desc", Encoding::RLE_DICTIONARY);
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_version_v2() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--parquet-version")
+        .arg("v2")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_parquet_file_version(&path, 2);
+}
+
+/// `-u` is the short alias for `--uncompressed-column-overrides`.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_uncompressed_column_overrides_short_alias() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("-u")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_column_compression(&path, "r_reason_desc", Compression::UNCOMPRESSED);
+}
+
+/// The writer-property list flags accept space-separated values, not just
+/// the comma-delimited form, matching the pre-upstream fork's ergonomics.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_list_flags_accept_space_separated_values() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--uncompressed-column-overrides")
+        .arg("r_reason_id")
+        .arg("r_reason_desc")
+        .arg("--disable-dictionary-encoding")
+        .arg("r_reason_id")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    for column in ["r_reason_id", "r_reason_desc"] {
+        expect_column_compression(&path, column, Compression::UNCOMPRESSED);
+        expect_column_encoding_absent(&path, column, Encoding::PLAIN_DICTIONARY);
+        expect_column_encoding_absent(&path, column, Encoding::RLE_DICTIONARY);
+    }
+}
+
+/// Unknown columns in `--uncompressed-column-overrides` and
+/// `--disable-dictionary-encoding` are silently ignored.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_writer_flags_silently_ignore_unknown_columns() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--uncompressed-column-overrides")
+        .arg("l_comment")
+        .arg("--disable-dictionary-encoding")
+        .arg("l_comment")
+        .assert()
+        .success();
+
+    assert!(
+        temp_dir.path().join("reason.parquet").exists(),
+        "expected reason.parquet to be generated even when writer flags name a TPC-H-only column"
+    );
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_decimal_column_type_f64() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--decimal-column-type")
+        .arg("f64")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("item.parquet");
+    expect_column_arrow_type(&path, "i_current_price", &DataType::Float64);
+}
+
+/// TPC-DS declares decimals at three precisions: (5,2), (7,2) and (15,2).
+/// `--decimal-column-type f64` has to convert all of them, including the
+/// GMT offset columns that are built by the shared address helper.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_decimal_column_type_f64_covers_every_precision() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item,store,promotion")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--decimal-column-type")
+        .arg("f64")
+        .assert()
+        .success();
+
+    // (7,2) direct, (5,2) via the address helper, (15,2) direct.
+    for (table, column) in [
+        ("item", "i_wholesale_cost"),
+        ("store", "s_gmt_offset"),
+        ("promotion", "p_cost"),
+    ] {
+        let path = temp_dir.path().join(format!("{table}.parquet"));
+        expect_column_arrow_type(&path, column, &DataType::Float64);
+    }
+}
+
+/// Without the flag, each decimal column keeps the precision TPC-DS declares
+/// for it rather than one precision applied to all of them.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_default_decimal_precisions_are_per_column() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item,store,promotion")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .assert()
+        .success();
+
+    for (table, column, expected) in [
+        ("item", "i_wholesale_cost", DataType::Decimal128(7, 2)),
+        ("store", "s_gmt_offset", DataType::Decimal128(5, 2)),
+        ("promotion", "p_cost", DataType::Decimal128(15, 2)),
+    ] {
+        let path = temp_dir.path().join(format!("{table}.parquet"));
+        expect_column_arrow_type(&path, column, &expected);
+    }
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_date_column_type_timestamp_ms() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--date-column-type")
+        .arg("timestamp_ms")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("item.parquet");
+    expect_column_arrow_type(
+        &path,
+        "i_rec_start_date",
+        &DataType::Timestamp(TimeUnit::Millisecond, None),
+    );
 }
 
 #[test]
