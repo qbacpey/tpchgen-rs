@@ -49,9 +49,9 @@ mod region;
 mod supplier;
 
 pub use customer::CustomerArrow;
-pub use lineitem::LineItemArrow;
+pub use lineitem::{LineItemArrow, lineitem_batch};
 pub use nation::NationArrow;
-pub use order::OrderArrow;
+pub use order::{OrderArrow, order_batch};
 pub use part::PartArrow;
 pub use partsupp::PartSuppArrow;
 pub use region::RegionArrow;
