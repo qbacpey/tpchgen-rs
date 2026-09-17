@@ -1688,9 +1688,16 @@ impl<'a> OrderGeneratorIterator<'a> {
 
     /// Creates an order with the given index
     fn make_order(&mut self, index: i64) -> Order<'a> {
-        let order_key = OrderGenerator::make_order_key(index);
-
         let order_date = self.order_date_random.next_value();
+        self.make_order_with_date(index, order_date)
+    }
+
+    /// Creates an order with the given index and a previously read `o_orderdate`
+    ///
+    /// The caller must have read the date for this row from
+    /// `order_date_random`, and nothing else.
+    fn make_order_with_date(&mut self, index: i64, order_date: i32) -> Order<'a> {
+        let order_key = OrderGenerator::make_order_key(index);
 
         // generate customer key, taking into account customer mortality rate
         let mut customer_key = self.customer_key_random.next_value();
@@ -1746,18 +1753,9 @@ impl<'a> OrderGeneratorIterator<'a> {
             o_comment: self.comment_random.next_value(),
         }
     }
-}
 
-impl<'a> Iterator for OrderGeneratorIterator<'a> {
-    type Item = Order<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.row_count {
-            return None;
-        }
-
-        let order = self.make_order(self.start_index + self.index + 1);
-
+    /// Advances every random stream past the current row
+    fn finish_row(&mut self) {
         self.order_date_random.row_finished();
         self.line_count_random.row_finished();
         self.customer_key_random.row_finished();
@@ -1772,8 +1770,71 @@ impl<'a> Iterator for OrderGeneratorIterator<'a> {
         self.line_ship_date_random.row_finished();
 
         self.index += 1;
+    }
+
+    /// Returns an iterator over the orders of this part whose `o_orderdate`
+    /// falls within `low..=high` (in generated date units, see
+    /// [`dates::MIN_GENERATE_DATE`]).
+    ///
+    /// Rows outside the range are skipped after reading only their date, which
+    /// is a single random draw, rather than being materialized and discarded.
+    /// The rows that are returned are identical to the ones
+    /// [`OrderGeneratorIterator`] produces.
+    pub fn with_order_date_range(self, low: i32, high: i32) -> OrderDateRangeIterator<'a> {
+        OrderDateRangeIterator {
+            inner: self,
+            low,
+            high,
+        }
+    }
+}
+
+impl<'a> Iterator for OrderGeneratorIterator<'a> {
+    type Item = Order<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.row_count {
+            return None;
+        }
+
+        let order = self.make_order(self.start_index + self.index + 1);
+        self.finish_row();
 
         Some(order)
+    }
+}
+
+/// Iterator that generates the [`Order`] rows of a part that fall within an
+/// inclusive `o_orderdate` range
+///
+/// See [`OrderGeneratorIterator::with_order_date_range`].
+#[derive(Debug)]
+pub struct OrderDateRangeIterator<'a> {
+    inner: OrderGeneratorIterator<'a>,
+    low: i32,
+    high: i32,
+}
+
+impl<'a> Iterator for OrderDateRangeIterator<'a> {
+    type Item = Order<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let inner = &mut self.inner;
+            if inner.index >= inner.row_count {
+                return None;
+            }
+
+            let index = inner.start_index + inner.index + 1;
+            let order_date = inner.order_date_random.next_value();
+            let keep = order_date >= self.low && order_date <= self.high;
+            let order = keep.then(|| inner.make_order_with_date(index, order_date));
+            inner.finish_row();
+
+            if order.is_some() {
+                return order;
+            }
+        }
     }
 }
 
@@ -2142,6 +2203,16 @@ impl<'a> LineItemGeneratorIterator<'a> {
 
     /// Creates a line item with the given order index
     fn make_line_item(&mut self, order_index: i64) -> LineItem<'a> {
+        let ship_date = self.ship_date_random.next_value() + self.order_date;
+        self.make_line_item_with_ship_date(order_index, ship_date)
+    }
+
+    /// Creates a line item with the given order index and a previously read
+    /// `l_shipdate`
+    ///
+    /// The caller must have read the ship date for this line from
+    /// `ship_date_random` (and added `order_date` to it), and nothing else.
+    fn make_line_item_with_ship_date(&mut self, order_index: i64, ship_date: i32) -> LineItem<'a> {
         let order_key = OrderGenerator::make_order_key(order_index);
 
         let quantity = self.quantity_random.next_value();
@@ -2160,8 +2231,6 @@ impl<'a> LineItemGeneratorIterator<'a> {
         let part_price = PartGeneratorIterator::calculate_part_price(part_key);
         let extended_price = part_price * quantity as i64;
 
-        let mut ship_date = self.ship_date_random.next_value();
-        ship_date += self.order_date;
         let mut commit_date = self.commit_date_random.next_value();
         commit_date += self.order_date;
         let mut receipt_date = self.receipt_date_random.next_value();
@@ -2202,6 +2271,76 @@ impl<'a> LineItemGeneratorIterator<'a> {
             l_comment: comment,
         }
     }
+
+    /// Consumes the random draws of one line item without building it
+    ///
+    /// The caller must have read the line's ship date from `ship_date_random`
+    /// and pass it here, because `l_returnflag` is only drawn for lines whose
+    /// receipt date is in the past.
+    fn skip_line_item(&mut self, ship_date: i32) {
+        self.quantity_random.next_value();
+        self.discount_random.next_value();
+        self.tax_random.next_value();
+        self.line_part_key_random.next_value();
+        self.supplier_number_random.next_value();
+        self.commit_date_random.next_value();
+        let receipt_date = self.receipt_date_random.next_value() + ship_date;
+        if TPCHDate::is_in_past(receipt_date) {
+            self.returned_flag_random.next_value();
+        }
+        self.ship_instructions_random.next_value();
+        self.ship_mode_random.next_value();
+        self.comment_random.next_value();
+    }
+
+    /// Advances every random stream past the current order and reads the next
+    /// order's line count and date
+    fn finish_order(&mut self) {
+        self.order_date_random.row_finished();
+        self.line_count_random.row_finished();
+
+        self.quantity_random.row_finished();
+        self.discount_random.row_finished();
+        self.tax_random.row_finished();
+
+        self.line_part_key_random.row_finished();
+        self.supplier_number_random.row_finished();
+
+        self.ship_date_random.row_finished();
+        self.commit_date_random.row_finished();
+        self.receipt_date_random.row_finished();
+
+        self.returned_flag_random.row_finished();
+        self.ship_instructions_random.row_finished();
+        self.ship_mode_random.row_finished();
+
+        self.comment_random.row_finished();
+
+        self.index += 1;
+
+        // generate information for next order
+        self.line_count = self.line_count_random.next_value() - 1;
+        self.order_date = self.order_date_random.next_value();
+        self.line_number = 0;
+    }
+
+    /// Returns an iterator over the line items of this part whose `l_shipdate`
+    /// falls within `low..=high` (in generated date units, see
+    /// [`dates::MIN_GENERATE_DATE`]).
+    ///
+    /// Lines outside the range are skipped without being materialized, and
+    /// orders with no line in the range are skipped after reading only their
+    /// date and ship date draws. The lines that are returned are identical to
+    /// the ones [`LineItemGeneratorIterator`] produces.
+    pub fn with_ship_date_range(self, low: i32, high: i32) -> LineItemShipDateRangeIterator<'a> {
+        LineItemShipDateRangeIterator {
+            inner: self,
+            low,
+            high,
+            ship_dates: [0; OrderGenerator::LINE_COUNT_MAX as usize],
+            order_started: false,
+        }
+    }
 }
 
 impl<'a> Iterator for LineItemGeneratorIterator<'a> {
@@ -2217,41 +2356,159 @@ impl<'a> Iterator for LineItemGeneratorIterator<'a> {
 
         // advance next row only when all lines for the order have been produced
         if self.line_number > self.line_count {
-            self.order_date_random.row_finished();
-            self.line_count_random.row_finished();
-
-            self.quantity_random.row_finished();
-            self.discount_random.row_finished();
-            self.tax_random.row_finished();
-
-            self.line_part_key_random.row_finished();
-            self.supplier_number_random.row_finished();
-
-            self.ship_date_random.row_finished();
-            self.commit_date_random.row_finished();
-            self.receipt_date_random.row_finished();
-
-            self.returned_flag_random.row_finished();
-            self.ship_instructions_random.row_finished();
-            self.ship_mode_random.row_finished();
-
-            self.comment_random.row_finished();
-
-            self.index += 1;
-
-            // generate information for next order
-            self.line_count = self.line_count_random.next_value() - 1;
-            self.order_date = self.order_date_random.next_value();
-            self.line_number = 0;
+            self.finish_order();
         }
 
         Some(line_item)
     }
 }
 
+/// Iterator that generates the [`LineItem`] rows of a part that fall within an
+/// inclusive `l_shipdate` range
+///
+/// See [`LineItemGeneratorIterator::with_ship_date_range`].
+#[derive(Debug)]
+pub struct LineItemShipDateRangeIterator<'a> {
+    inner: LineItemGeneratorIterator<'a>,
+    low: i32,
+    high: i32,
+    /// Ship dates of the current order's lines, read ahead of the other columns
+    ship_dates: [i32; OrderGenerator::LINE_COUNT_MAX as usize],
+    /// Whether [`Self::ship_dates`] holds the current order's draws
+    order_started: bool,
+}
+
+impl<'a> Iterator for LineItemShipDateRangeIterator<'a> {
+    type Item = LineItem<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let inner = &mut self.inner;
+            if inner.index >= inner.row_count {
+                return None;
+            }
+
+            // The ship date stream is independent of the other line columns, so
+            // the whole order's ship dates can be drawn before deciding which
+            // of its lines are worth building.
+            if !self.order_started {
+                for line in 0..=inner.line_count {
+                    self.ship_dates[line as usize] =
+                        inner.ship_date_random.next_value() + inner.order_date;
+                }
+                self.order_started = true;
+            }
+
+            let order_index = inner.start_index + inner.index + 1;
+            let mut line_item = None;
+            while inner.line_number <= inner.line_count {
+                let ship_date = self.ship_dates[inner.line_number as usize];
+                if ship_date >= self.low && ship_date <= self.high {
+                    line_item = Some(inner.make_line_item_with_ship_date(order_index, ship_date));
+                } else {
+                    inner.skip_line_item(ship_date);
+                }
+                inner.line_number += 1;
+                if line_item.is_some() {
+                    break;
+                }
+            }
+
+            if inner.line_number > inner.line_count {
+                inner.finish_order();
+                self.order_started = false;
+            }
+
+            if line_item.is_some() {
+                return line_item;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A date range that keeps part of the domain, in generated date units
+    fn mid_range() -> (i32, i32) {
+        let low = dates::MIN_GENERATE_DATE + 400;
+        (low, low + 199)
+    }
+
+    #[test]
+    fn test_order_date_range_matches_filtered_full_generation() {
+        let (low, high) = mid_range();
+        let generator = OrderGenerator::new(0.1, 1, 1);
+
+        let expected: Vec<_> = generator
+            .iter()
+            .filter(|order| {
+                let date = order.o_orderdate.into_inner() + dates::MIN_GENERATE_DATE;
+                date >= low && date <= high
+            })
+            .collect();
+        let actual: Vec<_> = generator.iter().with_order_date_range(low, high).collect();
+
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_order_date_range_is_exhaustive_across_parts() {
+        let generator = OrderGenerator::new(0.1, 3, 5);
+        let all = OrderGenerator::calculate_row_count(0.1, 3, 5) as usize;
+        let split = dates::MIN_GENERATE_DATE + 1000;
+
+        let below = generator
+            .iter()
+            .with_order_date_range(i32::MIN, split - 1)
+            .count();
+        let above = generator
+            .iter()
+            .with_order_date_range(split, i32::MAX)
+            .count();
+
+        assert!(below > 0 && above > 0);
+        assert_eq!(below + above, all);
+    }
+
+    #[test]
+    fn test_ship_date_range_matches_filtered_full_generation() {
+        let (low, high) = mid_range();
+        let generator = LineItemGenerator::new(0.1, 1, 1);
+
+        let expected: Vec<_> = generator
+            .iter()
+            .filter(|line| {
+                let date = line.l_shipdate.into_inner() + dates::MIN_GENERATE_DATE;
+                date >= low && date <= high
+            })
+            .collect();
+        let actual: Vec<_> = generator.iter().with_ship_date_range(low, high).collect();
+
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_ship_date_range_is_exhaustive_across_parts() {
+        let generator = LineItemGenerator::new(0.1, 2, 3);
+        let all = generator.iter().count();
+        let split = dates::MIN_GENERATE_DATE + 1000;
+
+        let below = generator
+            .iter()
+            .with_ship_date_range(i32::MIN, split - 1)
+            .count();
+        let above = generator
+            .iter()
+            .with_ship_date_range(split, i32::MAX)
+            .count();
+
+        assert!(below > 0 && above > 0);
+        assert_eq!(below + above, all);
+    }
 
     #[test]
     fn test_nation_generator() {

@@ -8,7 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
 use std::sync::{Arc, LazyLock};
-use tpchgen::generators::{LineItemGenerator, LineItemGeneratorIterator};
+use tpchgen::generators::{LineItem, LineItemGenerator, LineItemGeneratorIterator};
 
 /// Generate  [`LineItem`]s in [`RecordBatch`] format
 ///
@@ -110,6 +110,28 @@ impl Iterator for LineItemArrow {
             return None;
         }
 
+        Some(lineitem_batch(
+            &self.schema,
+            &self.column_type_config,
+            &rows,
+        ))
+    }
+}
+
+/// Converts a slice of [`LineItem`] rows into a [`RecordBatch`]
+///
+/// This is the conversion [`LineItemArrow`] applies to the rows it pulls from
+/// its generator, exposed for callers that buffer or reorder rows themselves.
+/// `schema` must describe `config`, as [`LineItemArrow::schema_ref`] does for
+/// the default configuration.
+///
+/// [`LineItem`]: tpchgen::generators::LineItem
+pub fn lineitem_batch(
+    schema: &SchemaRef,
+    config: &ColumnTypeConfig,
+    rows: &[LineItem<'_>],
+) -> Result<RecordBatch, ArrowError> {
+    {
         // Convert column by column
         let l_orderkey = Int64Array::from_iter_values(rows.iter().map(|row| row.l_orderkey));
         let l_partkey = Int64Array::from_iter_values(rows.iter().map(|row| row.l_partkey));
@@ -117,7 +139,7 @@ impl Iterator for LineItemArrow {
         let l_linenumber = Int32Array::from_iter_values(rows.iter().map(|row| row.l_linenumber));
 
         // Build the decimal/float columns based on config
-        let l_quantity: ArrayRef = match self.column_type_config.decimal_type {
+        let l_quantity: ArrayRef = match config.decimal_type {
             DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.l_quantity as f64),
             )),
@@ -128,7 +150,7 @@ impl Iterator for LineItemArrow {
             }
         };
 
-        let l_extended_price: ArrayRef = match self.column_type_config.decimal_type {
+        let l_extended_price: ArrayRef = match config.decimal_type {
             DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.l_extendedprice.as_f64()),
             )),
@@ -137,7 +159,7 @@ impl Iterator for LineItemArrow {
             )),
         };
 
-        let l_discount: ArrayRef = match self.column_type_config.decimal_type {
+        let l_discount: ArrayRef = match config.decimal_type {
             DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.l_discount.as_f64()),
             )),
@@ -146,7 +168,7 @@ impl Iterator for LineItemArrow {
             )),
         };
 
-        let l_tax: ArrayRef = match self.column_type_config.decimal_type {
+        let l_tax: ArrayRef = match config.decimal_type {
             DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.l_tax.as_f64()),
             )),
@@ -161,7 +183,7 @@ impl Iterator for LineItemArrow {
             StringViewArray::from_iter_values(rows.iter().map(|row| row.l_linestatus));
 
         // Build date columns based on config
-        let l_shipdate: ArrayRef = match self.column_type_config.date_type {
+        let l_shipdate: ArrayRef = match config.date_type {
             DateColumnType::Date32 => Arc::new(Date32Array::from_iter_values(
                 rows.iter().map(|row| to_arrow_date32(row.l_shipdate)),
             )),
@@ -170,7 +192,7 @@ impl Iterator for LineItemArrow {
             )),
         };
 
-        let l_commitdate: ArrayRef = match self.column_type_config.date_type {
+        let l_commitdate: ArrayRef = match config.date_type {
             DateColumnType::Date32 => Arc::new(Date32Array::from_iter_values(
                 rows.iter().map(|row| to_arrow_date32(row.l_commitdate)),
             )),
@@ -180,7 +202,7 @@ impl Iterator for LineItemArrow {
             )),
         };
 
-        let l_receiptdate: ArrayRef = match self.column_type_config.date_type {
+        let l_receiptdate: ArrayRef = match config.date_type {
             DateColumnType::Date32 => Arc::new(Date32Array::from_iter_values(
                 rows.iter().map(|row| to_arrow_date32(row.l_receiptdate)),
             )),
@@ -195,8 +217,8 @@ impl Iterator for LineItemArrow {
         let l_shipmode = StringViewArray::from_iter_values(rows.iter().map(|row| row.l_shipmode));
         let l_comment = StringViewArray::from_iter_values(rows.iter().map(|row| row.l_comment));
 
-        Some(RecordBatch::try_new(
-            Arc::clone(&self.schema),
+        RecordBatch::try_new(
+            Arc::clone(schema),
             vec![
                 Arc::new(l_orderkey),
                 Arc::new(l_partkey),
@@ -215,7 +237,7 @@ impl Iterator for LineItemArrow {
                 Arc::new(l_shipmode),
                 Arc::new(l_comment),
             ],
-        ))
+        )
     }
 }
 
