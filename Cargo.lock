@@ -1658,6 +1658,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpchgen-sorted"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "parquet",
+ "tempfile",
+ "tpchgen",
+ "tpchgen-arrow",
+]
+
+[[package]]
 name = "twox-hash"
 version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
