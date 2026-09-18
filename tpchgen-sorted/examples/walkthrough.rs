@@ -209,4 +209,55 @@ fn main() {
     }
     println!("\n   a skipped row costs a draw and a row advance, not a customer");
     println!("   key, a clerk name, a comment and a line item simulation");
+
+    // ----------------------------------------------------------------------
+    println!("\n6. A rejected row is not remembered and not looked up again.");
+    println!("   Every sweep walks the whole index space; a row rejected by one");
+    println!("   sweep is built by whichever sweep owns its day. Partitions");
+    println!("   cover the domain and do not overlap, so each row is built once.\n");
+
+    let sweeps = [(0, 999), (1000, TOTAL_DATE_RANGE - 1)];
+    let mut all_built: Vec<(i32, i64)> = Vec::new();
+    for (partition, (first_day, last_day)) in sweeps.iter().enumerate() {
+        let built: Vec<(i32, i64)> = OrderGenerator::new(SCALE_FACTOR, 1, 1)
+            .iter()
+            .with_order_date_range(MIN_GENERATE_DATE + first_day, MIN_GENERATE_DATE + last_day)
+            .map(|order| (order.o_orderdate.into_inner(), order.o_orderkey))
+            .collect();
+
+        println!(
+            "   sweep {} owns {} .. {}: walked all {order_count} rows, built {}, rejected {}",
+            partition + 1,
+            date(*first_day),
+            date(*last_day),
+            built.len(),
+            order_count as usize - built.len(),
+        );
+
+        // A sweep restricts, it does not order: rows come out in index order,
+        // which is why the bucket array from step 2 is still needed.
+        println!("      as the sweep emits them, in row index order:");
+        for (day, order_key) in &built {
+            println!("         {}  o_orderkey {order_key}", date(*day));
+        }
+        assert!(!built.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let mut partition_buckets: Vec<Vec<i64>> = vec![Vec::new(); TOTAL_DATE_RANGE as usize];
+        for (day, order_key) in &built {
+            partition_buckets[*day as usize].push(*order_key);
+        }
+        println!("      after bucketing, read back in day order:");
+        for (day, order_key) in read_in_day_order(&[partition_buckets]) {
+            println!("         {}  o_orderkey {order_key}", date(day));
+            all_built.push((day, order_key));
+        }
+    }
+
+    // No row was generated twice, none was lost, and because the sweeps ran in
+    // ascending day order their outputs concatenate into a sorted dataset.
+    assert_eq!(all_built.len(), order_count as usize);
+    assert!(all_built.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(all_built, sorted);
+    println!("\n   {order_count} rows built in total, each exactly once, and the two");
+    println!("   partitions read back to back are the sorted dataset from step 3");
 }
