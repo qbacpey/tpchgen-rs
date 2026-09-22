@@ -1,7 +1,7 @@
 //! TPC-DS data generation CLI with a dbgen compatible API.
 use crate::args::parse_row_group_bytes;
 use crate::logging::configure_logging;
-use crate::parquet::parse_column_encoding_pair;
+use crate::parquet::{parse_column_encoding_pair, ParquetVersion};
 #[cfg(feature = "indicatif-progress")]
 use crate::progress::IndicatifProgress;
 use crate::progress::{no_op_progress_tracker, ProgressTracker};
@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tpcdsgen::config::{CompatMode, Session, SessionBuilder, Table};
 use tpcdsgen::error::TpcdsError;
+use tpcdsgen_arrow::{ColumnTypeConfig, DateColumnType, DecimalColumnType};
 
 pub mod csv;
 pub mod dat;
@@ -23,6 +24,8 @@ mod generate;
 pub mod parquet;
 mod plan;
 mod progress;
+
+use progress::share_across_parts;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -139,6 +142,42 @@ struct ParquetArgs {
     /// through this flag, and BIT_PACKED is not supported for writing.
     #[arg(long, value_delimiter = ',', value_parser = parse_column_encoding_pair)]
     column_encoding: Option<Vec<(String, Encoding)>>,
+    /// Columns that should use UNCOMPRESSED block compression.
+    ///
+    /// Format: comma or space separated list of column names.
+    ///
+    /// Example: `--uncompressed-column-overrides=r_reason_desc`
+    #[arg(short, long, num_args = 0.., value_delimiter = ',')]
+    uncompressed_column_overrides: Vec<String>,
+    /// Disable dictionary encoding for specific columns.
+    ///
+    /// Format: comma or space separated list of column names.
+    ///
+    /// Example: `--disable-dictionary-encoding=r_reason_desc`
+    #[arg(long = "disable-dictionary-encoding", num_args = 0.., value_delimiter = ',')]
+    disable_dictionary_encoding_columns: Vec<String>,
+    /// Parquet format version to write.
+    ///
+    /// Version 1 (default) has broader compatibility. Version 2 uses Data Page V2
+    /// format with improved encodings. Ensure downstream tools support version 2
+    /// before enabling.
+    ///
+    /// Valid values: v1 (default), v2
+    #[arg(long, default_value = "v1", value_parser = clap::value_parser!(ParquetVersion))]
+    parquet_version: ParquetVersion,
+    /// Type to use for decimal/monetary columns.
+    ///
+    /// Valid values: decimal128 (default), f64
+    ///
+    /// TPC-DS decimals are `Decimal128(38, 2)`. Generated values fit exactly in
+    /// `f64`, but the declared precision exceeds what `f64` represents exactly.
+    #[arg(long, default_value = "decimal128", value_parser = clap::value_parser!(DecimalColumnType))]
+    decimal_column_type: DecimalColumnType,
+    /// Type to use for date columns.
+    ///
+    /// Valid values: date32 (default), timestamp_ms
+    #[arg(long, default_value = "date32", value_parser = clap::value_parser!(DateColumnType))]
+    date_column_type: DateColumnType,
 }
 
 #[derive(Args)]
@@ -158,6 +197,14 @@ pub struct CommonArgs {
     /// Reference implementation to match (default: trino)
     #[arg(long, default_value_t = CompatMode::Trino)]
     compat: CompatMode,
+
+    /// Number of part(itions) to generate. If not specified creates a single file per table
+    #[arg(short, long)]
+    parts: Option<i32>,
+
+    /// Which part(ition) to generate (1-based). If not specified, generates all parts
+    #[arg(long)]
+    part: Option<i32>,
 
     /// Verbose output
     ///
@@ -208,6 +255,13 @@ impl ParquetArgs {
                 self.row_group_bytes,
                 self.num_threads,
                 self.column_encoding,
+                self.uncompressed_column_overrides,
+                self.disable_dictionary_encoding_columns,
+                self.parquet_version,
+                ColumnTypeConfig {
+                    decimal_type: self.decimal_column_type,
+                    date_type: self.date_column_type,
+                },
             )
             .await
     }
@@ -221,12 +275,17 @@ impl CommonArgs {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_parquet(
         self,
         compression: Compression,
         row_group_bytes: i64,
         num_threads: usize,
         column_encoding: Option<Vec<(String, Encoding)>>,
+        uncompressed_column_overrides: Vec<String>,
+        disable_dictionary_encoding_columns: Vec<String>,
+        parquet_version: ParquetVersion,
+        column_type_config: ColumnTypeConfig,
     ) -> Result<()> {
         let output = parquet::Parquet::new(
             self.output_dir.clone(),
@@ -234,6 +293,10 @@ impl CommonArgs {
             row_group_bytes,
             num_threads,
             column_encoding,
+            uncompressed_column_overrides,
+            disable_dictionary_encoding_columns,
+            parquet_version,
+            column_type_config,
         );
         self.run_output(OutputFormat::Parquet(output)).await
     }
@@ -258,27 +321,39 @@ impl CommonArgs {
         let (progress, log_writer) = self.progress_tracker();
         configure_logging(self.verbose, self.quiet, log_writer);
 
+        let parts = self.part_list()?;
+
         std::fs::create_dir_all(&self.output_dir)?;
 
         match output_format {
             // Parquet generates all tables in one call so that multiple
             // tables can be generated concurrently
             OutputFormat::Parquet(output) => {
-                let mut table_sessions = Vec::with_capacity(tables.len());
-                for table in tables {
-                    let session = self.to_session(Some(table.get_name().to_string()))?;
-                    table_sessions.push((table, session));
+                let mut table_sessions = Vec::with_capacity(tables.len() * parts.len());
+                for table in &tables {
+                    for &part in &parts {
+                        let session = self.to_session(Some(table.get_name().to_string()), part)?;
+                        table_sessions.push((*table, session));
+                    }
                 }
                 output
                     .generate_tables(table_sessions, progress.clone())
                     .await?;
             }
             OutputFormat::Dat(output) => {
-                let mut table_sessions = Vec::with_capacity(tables.len());
-                for table in tables {
-                    let session = self.to_session(Some(table.get_name().to_string()))?;
-                    let progress = output.register_table(table, &session, progress.clone());
-                    table_sessions.push((table, session, progress));
+                let mut table_sessions = Vec::with_capacity(tables.len() * parts.len());
+                for table in &tables {
+                    let sessions = parts
+                        .iter()
+                        .map(|&part| self.to_session(Some(table.get_name().to_string()), part))
+                        .collect::<Result<Vec<_>>>()?;
+                    // One bar per table, shared across all its parts.
+                    let table_progress =
+                        output.register_table(*table, &sessions[0], progress.clone());
+                    let part_progress = share_across_parts(table_progress, sessions.len());
+                    for (session, progress) in sessions.into_iter().zip(part_progress) {
+                        table_sessions.push((*table, session, progress));
+                    }
                 }
                 progress.start();
                 for (table, session, progress) in table_sessions {
@@ -286,11 +361,19 @@ impl CommonArgs {
                 }
             }
             OutputFormat::Csv(output) => {
-                let mut table_sessions = Vec::with_capacity(tables.len());
-                for table in tables {
-                    let session = self.to_session(Some(table.get_name().to_string()))?;
-                    let progress = output.register_table(table, &session, progress.clone());
-                    table_sessions.push((table, session, progress));
+                let mut table_sessions = Vec::with_capacity(tables.len() * parts.len());
+                for table in &tables {
+                    let sessions = parts
+                        .iter()
+                        .map(|&part| self.to_session(Some(table.get_name().to_string()), part))
+                        .collect::<Result<Vec<_>>>()?;
+                    // One bar per table, shared across all its parts.
+                    let table_progress =
+                        output.register_table(*table, &sessions[0], progress.clone());
+                    let part_progress = share_across_parts(table_progress, sessions.len());
+                    for (session, progress) in sessions.into_iter().zip(part_progress) {
+                        table_sessions.push((*table, session, progress));
+                    }
                 }
                 progress.start();
                 for (table, session, progress) in table_sessions {
@@ -349,7 +432,30 @@ impl CommonArgs {
         Ok(tables)
     }
 
-    fn to_session(&self, table: Option<String>) -> Result<Session> {
+    /// Return the list of 1-based part numbers to generate, or `[None]` when
+    /// no `--part`/`--parts` were given (a single, unnumbered file per
+    /// table).
+    ///
+    /// Mirrors `tpchgen-cli`'s `--parts`/`--part` semantics: `--parts` alone
+    /// generates every part as a separate file, `--part` requires `--parts`
+    /// to be set alongside it and restricts generation to just that part.
+    fn part_list(&self) -> Result<Vec<Option<i32>>> {
+        match (self.part, self.parts) {
+            (Some(_), None) => Err(TpcdsError::new(
+                "The --part option requires the --parts option to be set",
+            )
+            .into()),
+            (None, Some(parts)) if parts < 1 => Err(TpcdsError::new(&format!(
+                "Invalid --parts value '{parts}'. Expected a number greater than zero"
+            ))
+            .into()),
+            (None, Some(parts)) => Ok((1..=parts).map(Some).collect()),
+            (Some(part), Some(_)) => Ok(vec![Some(part)]),
+            (None, None) => Ok(vec![None]),
+        }
+    }
+
+    fn to_session(&self, table: Option<String>, part: Option<i32>) -> Result<Session> {
         let table = table.as_deref().map(parse_table).transpose()?;
 
         // store the command line arguments used to create this
@@ -358,6 +464,9 @@ impl CommonArgs {
         let mut builder = SessionBuilder::new()
             .with_scale_factor(self.scale_factor)
             .with_compat_mode(self.compat)
+            .with_chunk_number(part.unwrap_or(1))
+            .with_total_chunks(self.parts.unwrap_or(1))
+            .with_partitioned(self.parts.is_some())
             .with_command_line_arguments(command_line_arguments);
 
         if let Some(table) = table {
@@ -498,6 +607,8 @@ mod tests {
             output_dir: PathBuf::new(),
             tables: Some(tables),
             compat: CompatMode::Trino,
+            parts: None,
+            part: None,
             verbose: false,
             quiet: false,
             progress_bars_enabled: false,
@@ -588,5 +699,48 @@ mod tests {
                 Table::WebSales,
             ]
         );
+    }
+
+    fn args_with_parts(parts: Option<i32>, part: Option<i32>) -> CommonArgs {
+        let mut args = args_with_tables(vec![Table::Reason]);
+        args.parts = parts;
+        args.part = part;
+        args
+    }
+
+    #[test]
+    fn part_list_defaults_to_single_unnumbered_file() {
+        assert_eq!(args_with_parts(None, None).part_list().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn part_list_expands_parts_alone_into_every_part() {
+        assert_eq!(
+            args_with_parts(Some(3), None).part_list().unwrap(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn part_list_with_part_and_parts_generates_just_that_part() {
+        assert_eq!(
+            args_with_parts(Some(3), Some(2)).part_list().unwrap(),
+            vec![Some(2)]
+        );
+    }
+
+    #[test]
+    fn part_list_rejects_part_without_parts() {
+        let err = args_with_parts(None, Some(2)).part_list().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The --part option requires the --parts option to be set"
+        );
+    }
+
+    #[test]
+    fn part_list_rejects_non_positive_parts() {
+        assert!(args_with_parts(Some(0), None).part_list().is_err());
+        assert!(args_with_parts(Some(-1), None).part_list().is_err());
     }
 }

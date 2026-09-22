@@ -1,8 +1,8 @@
 use crate::conversions::{
-    gmt_offset_decimal128_array, integer_sk_opt, is_null, opt, string_view_array_from_opt_iter,
-    string_view_array_from_string_opt_iter,
+    decimal_arrow_type, gmt_offset_array, integer_sk_opt, is_null, opt,
+    string_view_array_from_opt_iter, string_view_array_from_string_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
 use arrow::array::{Int32Array, RecordBatch, StringViewBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -14,6 +14,8 @@ use tpcdsgen::row::{CustomerAddressRowGenerator, GeneratedRow};
 pub struct CustomerAddressArrow {
     inner: RowIter<CustomerAddressRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl CustomerAddressArrow {
@@ -27,6 +29,8 @@ impl CustomerAddressArrow {
         Self {
             inner: RowIter::new(CustomerAddressRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -51,11 +55,21 @@ impl CustomerAddressArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for CustomerAddressArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -165,7 +179,7 @@ impl Iterator for CustomerAddressArrow {
                 Arc::new(state_b.finish()),
                 Arc::new(zip_b.finish()),
                 Arc::new(country_b.finish()),
-                Arc::new(gmt_offset_decimal128_array(gmt_offset)),
+                gmt_offset_array(gmt_offset, self.column_type_config.decimal_type),
                 Arc::new(string_view_array_from_opt_iter(
                     location_type.iter().map(|s| s.as_deref()),
                 )),
@@ -175,9 +189,9 @@ impl Iterator for CustomerAddressArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("ca_address_sk", DataType::Int32, false),
         Field::new("ca_address_id", DataType::Utf8View, false),
@@ -190,7 +204,11 @@ fn make_schema() -> SchemaRef {
         Field::new("ca_state", DataType::Utf8View, true),
         Field::new("ca_zip", DataType::Utf8View, true),
         Field::new("ca_country", DataType::Utf8View, true),
-        Field::new("ca_gmt_offset", DataType::Decimal128(5, 2), true),
+        Field::new(
+            "ca_gmt_offset",
+            decimal_arrow_type(config.decimal_type, 5),
+            true,
+        ),
         Field::new("ca_location_type", DataType::Utf8View, true),
     ]))
 }

@@ -1,5 +1,5 @@
-use crate::conversions::{decimal128_7_2_array, decimal_to_i128, integer_sk_opt, opt};
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
+use crate::conversions::{decimal_array, decimal_arrow_type, decimal_to_i128, integer_sk_opt, opt};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
 use arrow::array::{Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -11,6 +11,8 @@ use tpcdsgen::row::{CatalogSalesRowGenerator, GeneratedRow};
 pub struct CatalogReturnsArrow {
     inner: RowIter<CatalogSalesRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl CatalogReturnsArrow {
@@ -24,6 +26,8 @@ impl CatalogReturnsArrow {
         Self {
             inner: RowIter::new(CatalogSalesRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -48,11 +52,21 @@ impl CatalogReturnsArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for CatalogReturnsArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -140,7 +154,8 @@ impl Iterator for CatalogReturnsArrow {
             cr_net_loss.push(opt(nbm, 26, decimal_to_i128(p.get_net_loss())));
         }
 
-        let dec = decimal128_7_2_array;
+        let decimal_type = self.column_type_config.decimal_type;
+        let dec = |values| decimal_array(values, decimal_type, 7);
         let batch = RecordBatch::try_new(
             self.schema(),
             vec![
@@ -177,9 +192,9 @@ impl Iterator for CatalogReturnsArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("cr_returned_date_sk", DataType::Int32, true),
         Field::new("cr_returned_time_sk", DataType::Int32, true),
@@ -199,14 +214,46 @@ fn make_schema() -> SchemaRef {
         Field::new("cr_reason_sk", DataType::Int32, true),
         Field::new("cr_order_number", DataType::Int64, false),
         Field::new("cr_return_quantity", DataType::Int32, true),
-        Field::new("cr_return_amount", DataType::Decimal128(7, 2), true),
-        Field::new("cr_return_tax", DataType::Decimal128(7, 2), true),
-        Field::new("cr_return_amt_inc_tax", DataType::Decimal128(7, 2), true),
-        Field::new("cr_fee", DataType::Decimal128(7, 2), true),
-        Field::new("cr_return_ship_cost", DataType::Decimal128(7, 2), true),
-        Field::new("cr_refunded_cash", DataType::Decimal128(7, 2), true),
-        Field::new("cr_reversed_charge", DataType::Decimal128(7, 2), true),
-        Field::new("cr_store_credit", DataType::Decimal128(7, 2), true),
-        Field::new("cr_net_loss", DataType::Decimal128(7, 2), true),
+        Field::new(
+            "cr_return_amount",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "cr_return_tax",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "cr_return_amt_inc_tax",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new("cr_fee", decimal_arrow_type(config.decimal_type, 7), true),
+        Field::new(
+            "cr_return_ship_cost",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "cr_refunded_cash",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "cr_reversed_charge",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "cr_store_credit",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
+        Field::new(
+            "cr_net_loss",
+            decimal_arrow_type(config.decimal_type, 7),
+            true,
+        ),
     ]))
 }

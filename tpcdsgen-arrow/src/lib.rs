@@ -19,6 +19,8 @@ pub mod conversions;
 mod tables;
 
 use std::collections::VecDeque;
+use std::fmt;
+use std::str::FromStr;
 
 use tpcdsgen::config::Session;
 use tpcdsgen::row::{GeneratedRow, RowGenerator};
@@ -33,6 +35,84 @@ pub use tables::{
 
 /// Default number of rows per [`RecordBatch`](arrow::array::RecordBatch).
 pub const DEFAULT_BATCH_SIZE: usize = 8_000;
+
+/// Type to use for decimal/monetary columns.
+///
+/// Controls the Arrow type for TPC-DS monetary columns such as prices and totals.
+/// Generated values fit exactly in `f64`, but the default `Decimal128(38, 2)`
+/// declared precision exceeds what `f64` represents exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecimalColumnType {
+    #[default]
+    Decimal128,
+    F64,
+}
+
+impl fmt::Display for DecimalColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecimalColumnType::Decimal128 => write!(f, "decimal128"),
+            DecimalColumnType::F64 => write!(f, "f64"),
+        }
+    }
+}
+
+impl FromStr for DecimalColumnType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "decimal128" => Ok(DecimalColumnType::Decimal128),
+            "f64" => Ok(DecimalColumnType::F64),
+            _ => Err(format!(
+                "Invalid decimal column type: '{}'. Valid values are: decimal128, f64",
+                s
+            )),
+        }
+    }
+}
+
+/// Type to use for date columns.
+///
+/// Controls the Arrow type for TPC-DS `Date32` columns such as `d_date` and
+/// slowly-changing-dimension validity dates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DateColumnType {
+    #[default]
+    Date32,
+    TimestampMs,
+}
+
+impl fmt::Display for DateColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DateColumnType::Date32 => write!(f, "date32"),
+            DateColumnType::TimestampMs => write!(f, "timestamp_ms"),
+        }
+    }
+}
+
+impl FromStr for DateColumnType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "date32" => Ok(DateColumnType::Date32),
+            "timestamp_ms" => Ok(DateColumnType::TimestampMs),
+            _ => Err(format!(
+                "Invalid date column type: '{}'. Valid values are: date32, timestamp_ms",
+                s
+            )),
+        }
+    }
+}
+
+/// Configuration for column types in generated TPC-DS Arrow data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColumnTypeConfig {
+    pub decimal_type: DecimalColumnType,
+    pub date_type: DateColumnType,
+}
 
 /// Adapts a [`RowGenerator`] into a streaming [`Iterator`] of [`GeneratedRow`]s.
 ///

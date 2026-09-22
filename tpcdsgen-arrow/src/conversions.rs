@@ -1,6 +1,12 @@
 //! Routines to convert TPC-DS types to Arrow types
 
-use arrow::array::{Decimal128Array, StringViewArray, StringViewBuilder};
+use crate::{DateColumnType, DecimalColumnType};
+use arrow::array::{
+    ArrayRef, Date32Array, Decimal128Array, Float64Array, StringViewArray, StringViewBuilder,
+    TimestampMillisecondArray,
+};
+use arrow::datatypes::{DataType, TimeUnit};
+use std::sync::Arc;
 use tpcdsgen::types::{Address, Date, Decimal};
 
 /// Julian day number for the Unix epoch (1970-01-01)
@@ -49,6 +55,76 @@ pub fn decimal128_7_2_array(values: impl IntoIterator<Item = Option<i128>>) -> D
         .unwrap()
 }
 
+/// Scale shared by every TPC-DS decimal column.
+const DECIMAL_SCALE: i8 = 2;
+
+/// Arrow type for a decimal column of `precision` under `decimal_type`.
+///
+/// TPC-DS declares each decimal column with its own precision (5, 7, or 15),
+/// so the precision has to be supplied per column rather than assumed.
+pub fn decimal_arrow_type(decimal_type: DecimalColumnType, precision: u8) -> DataType {
+    match decimal_type {
+        DecimalColumnType::Decimal128 => DataType::Decimal128(precision, DECIMAL_SCALE),
+        DecimalColumnType::F64 => DataType::Float64,
+    }
+}
+
+/// Arrow type for date columns under `date_type`.
+pub fn date_arrow_type(date_type: DateColumnType) -> DataType {
+    match date_type {
+        DateColumnType::Date32 => DataType::Date32,
+        DateColumnType::TimestampMs => DataType::Timestamp(TimeUnit::Millisecond, None),
+    }
+}
+
+/// Build a decimal column of `precision` from unscaled integer values,
+/// honoring `decimal_type`.
+pub fn decimal_array(
+    values: impl IntoIterator<Item = Option<i128>>,
+    decimal_type: DecimalColumnType,
+    precision: u8,
+) -> ArrayRef {
+    match decimal_type {
+        DecimalColumnType::Decimal128 => Arc::new(
+            Decimal128Array::from_iter(values)
+                .with_precision_and_scale(precision, DECIMAL_SCALE)
+                .unwrap(),
+        ),
+        DecimalColumnType::F64 => Arc::new(Float64Array::from_iter(
+            values.into_iter().map(|v| v.map(|c| c as f64 / 100.0)),
+        )),
+    }
+}
+
+/// Convert an already built decimal column to `decimal_type`.
+///
+/// Used where the column is produced by a shared helper that returns a
+/// [`Decimal128Array`], such as [`address_columns`].
+pub fn decimal_array_as(array: Decimal128Array, decimal_type: DecimalColumnType) -> ArrayRef {
+    match decimal_type {
+        DecimalColumnType::Decimal128 => Arc::new(array),
+        DecimalColumnType::F64 => Arc::new(Float64Array::from_iter(
+            array.iter().map(|v| v.map(|c| c as f64 / 100.0)),
+        )),
+    }
+}
+
+/// Build a date column from Date32 day offsets, honoring `date_type`.
+pub fn date_array(
+    values: impl IntoIterator<Item = Option<i32>>,
+    date_type: DateColumnType,
+) -> ArrayRef {
+    const MILLIS_PER_DAY: i64 = 86_400_000;
+    match date_type {
+        DateColumnType::Date32 => Arc::new(Date32Array::from_iter(values)),
+        DateColumnType::TimestampMs => Arc::new(TimestampMillisecondArray::from_iter(
+            values
+                .into_iter()
+                .map(|d| d.map(|days| days as i64 * MILLIS_PER_DAY)),
+        )),
+    }
+}
+
 /// Build a TPC-DS DECIMAL(15,2) array from unscaled integer values.
 pub fn decimal128_15_2_array(values: impl IntoIterator<Item = Option<i128>>) -> Decimal128Array {
     Decimal128Array::from_iter(values)
@@ -67,6 +143,20 @@ pub fn gmt_offset_decimal128_array(
     )
     .with_precision_and_scale(5, 2)
     .unwrap()
+}
+
+/// Build a GMT offset column from whole-number offsets, honoring `decimal_type`.
+pub fn gmt_offset_array(
+    values: impl IntoIterator<Item = Option<i32>>,
+    decimal_type: DecimalColumnType,
+) -> ArrayRef {
+    decimal_array(
+        values
+            .into_iter()
+            .map(|value| value.map(|value| i128::from(value) * 100)),
+        decimal_type,
+        5,
+    )
 }
 
 /// Build a StringViewArray from an iterator of &str values (non-nullable).

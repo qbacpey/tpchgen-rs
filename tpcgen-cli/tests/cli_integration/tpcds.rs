@@ -1,4 +1,18 @@
-use super::test_helpers::{expect_column_encoding, expect_row_group_sizes, RowGroups};
+//! TPC-DS CLI integration tests.
+//!
+//! Fork-only Parquet flags are mirrored from TPC-H where applicable:
+//! - `tpch_parquet_uncompressed_column_overrides` -> `tpcds_parquet_uncompressed_column_overrides`
+//! - `tpch_parquet_disable_dictionary_encoding` -> `tpcds_parquet_disable_dictionary_encoding`
+//! - `tpch_parquet_version_v2` -> `tpcds_parquet_version_v2`
+//! - `tpch_parquet_decimal_column_type_f64` -> `tpcds_parquet_decimal_column_type_f64`
+//! - `tpch_parquet_date_column_type_timestamp_ms` -> `tpcds_parquet_date_column_type_timestamp_ms`
+//!
+//! Allowlisted as TPC-H-only: `--nationkey-type`, `--regionkey-type` (no nation/region tables in TPC-DS).
+
+use super::test_helpers::{
+    expect_column_arrow_type, expect_column_compression, expect_column_encoding,
+    expect_column_encoding_absent, expect_parquet_file_version, expect_row_group_sizes, RowGroups,
+};
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, TimeUnit};
@@ -13,7 +27,7 @@ use std::fs::File;
 use std::path::Path;
 use tempfile::tempdir;
 use tpcdsgen::config::{Session, SessionBuilder, Table};
-use tpcdsgen_arrow::{StoreReturnsArrow, StoreSalesArrow};
+use tpcdsgen_arrow::{ItemArrow, StoreReturnsArrow, StoreSalesArrow};
 
 /// Test that TPC-DS DAT generation is quiet unless logging is explicitly enabled.
 #[test]
@@ -238,6 +252,264 @@ fn test_tpcgen_cli_tpcds_parquet_compression() {
             assert_eq!(column.compression(), Compression::UNCOMPRESSED);
         }
     }
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_uncompressed_column_overrides() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--uncompressed-column-overrides")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_column_compression(&path, "r_reason_desc", Compression::UNCOMPRESSED);
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_disable_dictionary_encoding() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--disable-dictionary-encoding")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_column_encoding_absent(&path, "r_reason_desc", Encoding::PLAIN_DICTIONARY);
+    expect_column_encoding_absent(&path, "r_reason_desc", Encoding::RLE_DICTIONARY);
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_version_v2() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--parquet-version")
+        .arg("v2")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_parquet_file_version(&path, 2);
+}
+
+/// `-u` is the short alias for `--uncompressed-column-overrides`.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_uncompressed_column_overrides_short_alias() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("-u")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    expect_column_compression(&path, "r_reason_desc", Compression::UNCOMPRESSED);
+}
+
+/// The writer-property list flags accept space-separated values, not just
+/// the comma-delimited form, matching the pre-upstream fork's ergonomics.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_list_flags_accept_space_separated_values() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--uncompressed-column-overrides")
+        .arg("r_reason_id")
+        .arg("r_reason_desc")
+        .arg("--disable-dictionary-encoding")
+        .arg("r_reason_id")
+        .arg("r_reason_desc")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("reason.parquet");
+    for column in ["r_reason_id", "r_reason_desc"] {
+        expect_column_compression(&path, column, Compression::UNCOMPRESSED);
+        expect_column_encoding_absent(&path, column, Encoding::PLAIN_DICTIONARY);
+        expect_column_encoding_absent(&path, column, Encoding::RLE_DICTIONARY);
+    }
+}
+
+/// Unknown columns in `--uncompressed-column-overrides` and
+/// `--disable-dictionary-encoding` are silently ignored.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_writer_flags_silently_ignore_unknown_columns() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--uncompressed-column-overrides")
+        .arg("l_comment")
+        .arg("--disable-dictionary-encoding")
+        .arg("l_comment")
+        .assert()
+        .success();
+
+    assert!(
+        temp_dir.path().join("reason.parquet").exists(),
+        "expected reason.parquet to be generated even when writer flags name a TPC-H-only column"
+    );
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_decimal_column_type_f64() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--decimal-column-type")
+        .arg("f64")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("item.parquet");
+    expect_column_arrow_type(&path, "i_current_price", &DataType::Float64);
+}
+
+/// TPC-DS declares decimals at three precisions: (5,2), (7,2) and (15,2).
+/// `--decimal-column-type f64` has to convert all of them, including the
+/// GMT offset columns that are built by the shared address helper.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_decimal_column_type_f64_covers_every_precision() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item,store,promotion")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--decimal-column-type")
+        .arg("f64")
+        .assert()
+        .success();
+
+    // (7,2) direct, (5,2) via the address helper, (15,2) direct.
+    for (table, column) in [
+        ("item", "i_wholesale_cost"),
+        ("store", "s_gmt_offset"),
+        ("promotion", "p_cost"),
+    ] {
+        let path = temp_dir.path().join(format!("{table}.parquet"));
+        expect_column_arrow_type(&path, column, &DataType::Float64);
+    }
+}
+
+/// Without the flag, each decimal column keeps the precision TPC-DS declares
+/// for it rather than one precision applied to all of them.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_default_decimal_precisions_are_per_column() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item,store,promotion")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .assert()
+        .success();
+
+    for (table, column, expected) in [
+        ("item", "i_wholesale_cost", DataType::Decimal128(7, 2)),
+        ("store", "s_gmt_offset", DataType::Decimal128(5, 2)),
+        ("promotion", "p_cost", DataType::Decimal128(15, 2)),
+    ] {
+        let path = temp_dir.path().join(format!("{table}.parquet"));
+        expect_column_arrow_type(&path, column, &expected);
+    }
+}
+
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_date_column_type_timestamp_ms() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("item")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--date-column-type")
+        .arg("timestamp_ms")
+        .assert()
+        .success();
+
+    let path = temp_dir.path().join("item.parquet");
+    expect_column_arrow_type(
+        &path,
+        "i_rec_start_date",
+        &DataType::Timestamp(TimeUnit::Millisecond, None),
+    );
 }
 
 #[test]
@@ -1045,6 +1317,9 @@ fn read_concatenated_reference<R: RecordBatchReader>(mut reader: R) -> RecordBat
 /// store_returns is generated from the store_sales generator, so this also
 /// verifies that ranging over the *sales* source rows loses or duplicates no
 /// return rows at range boundaries.
+///
+/// Item is an SCD table, so this also verifies that range boundaries preserve
+/// the previous revision state needed by continuation rows.
 #[test]
 fn test_tpcgen_cli_tpcds_parquet_matches_single_pass_generation() {
     let temp_dir = tempdir().expect("Failed to create temporary directory");
@@ -1056,7 +1331,7 @@ fn test_tpcgen_cli_tpcds_parquet_matches_single_pass_generation() {
         .arg("--scale-factor")
         .arg("0.001")
         .arg("--tables")
-        .arg("store_sales,store_returns")
+        .arg("store_sales,store_returns,item")
         // small row groups to force several source row ranges
         .arg("--row-group-bytes")
         .arg("250000")
@@ -1078,6 +1353,16 @@ fn test_tpcgen_cli_tpcds_parquet_matches_single_pass_generation() {
     assert_eq!(num_row_groups, 3);
     let expected = read_concatenated_reference(StoreReturnsArrow::new(test_session(0.001)));
     assert_eq!(store_returns, expected);
+
+    let (item, num_row_groups) = read_concatenated_parquet(&temp_dir.path().join("item.parquet"));
+    // 2,000 source rows over 2 row groups starts the second range at row 1,001,
+    // a continuation revision that copies from row 1,000. Pin both numbers: if
+    // either drifts the split can land on a row that starts a new Item, where
+    // nothing is copied and the SCD case silently goes untested.
+    assert_eq!(num_row_groups, 2);
+    assert_eq!(item.num_rows(), 2_000);
+    let expected = read_concatenated_reference(ItemArrow::new(test_session(0.001)));
+    assert_eq!(item, expected);
 }
 
 /// Test that the number of threads does not change the generated files.
@@ -1228,4 +1513,294 @@ fn test_tpcgen_cli_tpcds_help_lists_tables() {
             "Expected `tpcds --help` to list {table}, got stdout: {stdout}"
         );
     }
+}
+
+/// Test that `--part` without `--parts` is rejected with the expected message.
+#[test]
+fn test_tpcgen_cli_tpcds_dat_part_without_parts_is_rejected() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    let assert = cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--part")
+        .arg("1")
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert_eq!(
+        stderr,
+        "Error: The --part option requires the --parts option to be set\n"
+    );
+}
+
+/// Test that a non-positive `--parts` is rejected.
+#[test]
+fn test_tpcgen_cli_tpcds_dat_rejects_non_positive_parts() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--parts")
+        .arg("0")
+        .assert()
+        .failure();
+}
+
+/// Test that `--parts` on a table well under dsdgen's 1M-row split threshold
+/// (`reason`) puts the whole table in chunk 1 and generates empty files for
+/// every other chunk, following dsdgen's own small-table semantics.
+#[test]
+fn test_tpcgen_cli_tpcds_dat_parts_small_table_stays_in_chunk_one() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--parts")
+        .arg("4")
+        .assert()
+        .success();
+
+    let chunk_one =
+        fs::read_to_string(temp_dir.path().join("reason/reason.1.dat")).expect("chunk 1 exists");
+    assert_eq!(chunk_one.lines().count(), 35, "chunk 1 has every row");
+
+    for chunk in 2..=4 {
+        let path = temp_dir.path().join(format!("reason/reason.{chunk}.dat"));
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("Expected {path:?} to exist: {err}"));
+        assert!(
+            contents.is_empty(),
+            "Expected chunk {chunk} of `reason` to be empty, got: {contents:?}"
+        );
+    }
+}
+
+/// Test that `--parts 1` nests output the same way as any other part count
+/// (`reason/reason.1.dat`), matching `tpchgen-cli`; only the absence of
+/// `--parts` uses a flat, unnumbered file.
+#[test]
+fn test_tpcgen_cli_tpcds_dat_parts_one_matches_tpch_naming() {
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("0.001")
+        .arg("--tables")
+        .arg("reason")
+        .arg("--output-dir")
+        .arg(temp_dir.path())
+        .arg("--parts")
+        .arg("1")
+        .assert()
+        .success();
+
+    assert!(
+        temp_dir.path().join("reason/reason.1.dat").is_file(),
+        "--parts 1 should nest like tpchgen-cli"
+    );
+    assert!(
+        !temp_dir.path().join("reason.dat").exists(),
+        "--parts 1 should not also produce a flat file"
+    );
+}
+
+/// Test that concatenating every `--parts` chunk of a DAT table, in order,
+/// reproduces exactly the unsplit single-file output (dsdgen's chunks are a
+/// position-independent partition of the same row sequence).
+#[test]
+fn test_tpcgen_cli_tpcds_dat_parts_concatenation_matches_unsplit_output() {
+    let unsplit_dir = tempdir().expect("Failed to create temporary directory");
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("call_center")
+        .arg("--output-dir")
+        .arg(unsplit_dir.path())
+        .assert()
+        .success();
+    let unsplit =
+        fs::read(unsplit_dir.path().join("call_center.dat")).expect("unsplit file exists");
+
+    let parts_dir = tempdir().expect("Failed to create temporary directory");
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("dat")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("call_center")
+        .arg("--output-dir")
+        .arg(parts_dir.path())
+        .arg("--parts")
+        .arg("4")
+        .assert()
+        .success();
+
+    let mut concatenated = Vec::new();
+    for chunk in 1..=4 {
+        let path = parts_dir
+            .path()
+            .join(format!("call_center/call_center.{chunk}.dat"));
+        concatenated.extend(fs::read(&path).unwrap_or_else(|err| panic!("{path:?} exists: {err}")));
+    }
+
+    assert_eq!(
+        concatenated, unsplit,
+        "Expected concatenated --parts chunks to reproduce the unsplit DAT output"
+    );
+}
+
+/// Test the same concatenation property for CSV, ignoring each part's own
+/// repeated header line (every part is an independently valid CSV file with
+/// its own header).
+#[test]
+fn test_tpcgen_cli_tpcds_csv_parts_concatenation_matches_unsplit_output() {
+    let unsplit_dir = tempdir().expect("Failed to create temporary directory");
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("csv")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("call_center")
+        .arg("--output-dir")
+        .arg(unsplit_dir.path())
+        .assert()
+        .success();
+    let unsplit =
+        fs::read_to_string(unsplit_dir.path().join("call_center.csv")).expect("unsplit exists");
+
+    let parts_dir = tempdir().expect("Failed to create temporary directory");
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("csv")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("call_center")
+        .arg("--output-dir")
+        .arg(parts_dir.path())
+        .arg("--parts")
+        .arg("4")
+        .assert()
+        .success();
+
+    let mut lines = unsplit.lines();
+    let header = lines.next().expect("unsplit CSV has a header");
+    let mut expected = header.to_string();
+    expected.push('\n');
+    expected.push_str(&lines.map(|line| format!("{line}\n")).collect::<String>());
+
+    let mut reconstructed = String::new();
+    for chunk in 1..=4 {
+        let path = parts_dir
+            .path()
+            .join(format!("call_center/call_center.{chunk}.csv"));
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path:?} exists: {err}"));
+        let mut chunk_lines = contents.lines();
+        let chunk_header = chunk_lines.next().expect("every chunk has its own header");
+        assert_eq!(chunk_header, header, "every chunk's header matches");
+        if chunk == 1 {
+            reconstructed.push_str(header);
+            reconstructed.push('\n');
+        }
+        reconstructed.push_str(
+            &chunk_lines
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        );
+    }
+
+    assert_eq!(
+        reconstructed, expected,
+        "Expected --parts chunk row data (headers aside) to reproduce the unsplit CSV output"
+    );
+}
+
+/// Test that `--parts` on Parquet output produces one file per part whose
+/// row counts sum to the unsplit file's row count.
+#[test]
+fn test_tpcgen_cli_tpcds_parquet_parts_row_counts_sum_to_unsplit() {
+    let unsplit_dir = tempdir().expect("Failed to create temporary directory");
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("call_center")
+        .arg("--output-dir")
+        .arg(unsplit_dir.path())
+        .assert()
+        .success();
+    let unsplit_row_count = parquet_row_count(&unsplit_dir.path().join("call_center.parquet"));
+
+    let parts_dir = tempdir().expect("Failed to create temporary directory");
+    cargo_bin_cmd!("tpcgen-cli")
+        .arg("tpcds")
+        .arg("parquet")
+        .arg("--scale-factor")
+        .arg("1")
+        .arg("--tables")
+        .arg("call_center")
+        .arg("--output-dir")
+        .arg(parts_dir.path())
+        .arg("--parts")
+        .arg("4")
+        .assert()
+        .success();
+
+    let mut total = 0usize;
+    for chunk in 1..=4 {
+        let path = parts_dir
+            .path()
+            .join(format!("call_center/call_center.{chunk}.parquet"));
+        assert!(path.exists(), "Expected {path:?} to exist");
+        total += parquet_row_count(&path);
+    }
+
+    assert_eq!(
+        total, unsplit_row_count,
+        "Expected summed --parts row counts to match the unsplit Parquet row count"
+    );
+}
+
+/// Return the total row count across all row groups of a Parquet file.
+fn parquet_row_count(path: &Path) -> usize {
+    let file = File::open(path).unwrap_or_else(|err| panic!("Failed to open {path:?}: {err}"));
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to read Parquet metadata");
+    builder
+        .build()
+        .expect("Failed to build Parquet reader")
+        .map(|batch| batch.expect("Failed to read Parquet batch").num_rows())
+        .sum()
 }

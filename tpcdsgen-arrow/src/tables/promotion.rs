@@ -1,8 +1,8 @@
 use crate::conversions::{
-    bool_to_yn, decimal128_15_2_array, decimal_to_i128, integer_sk_opt, opt,
+    bool_to_yn, decimal_array, decimal_arrow_type, decimal_to_i128, integer_sk_opt, opt,
     string_view_array_from_opt_iter,
 };
-use crate::{RowIter, DEFAULT_BATCH_SIZE};
+use crate::{ColumnTypeConfig, RowIter, DEFAULT_BATCH_SIZE};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -14,6 +14,8 @@ use tpcdsgen::row::{GeneratedRow, PromotionRowGenerator};
 pub struct PromotionArrow {
     inner: RowIter<PromotionRowGenerator>,
     batch_size: usize,
+    column_type_config: ColumnTypeConfig,
+    schema: SchemaRef,
 }
 
 impl PromotionArrow {
@@ -27,6 +29,8 @@ impl PromotionArrow {
         Self {
             inner: RowIter::new(PromotionRowGenerator::new(), session, row_count),
             batch_size: DEFAULT_BATCH_SIZE,
+            column_type_config: ColumnTypeConfig::default(),
+            schema: Arc::clone(&SCHEMA),
         }
     }
     pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
@@ -51,11 +55,21 @@ impl PromotionArrow {
         self.batch_size = batch_size;
         self
     }
+
+    pub fn with_column_type_config(mut self, config: ColumnTypeConfig) -> Self {
+        self.schema = if config == ColumnTypeConfig::default() {
+            Arc::clone(&SCHEMA)
+        } else {
+            make_schema(&config)
+        };
+        self.column_type_config = config;
+        self
+    }
 }
 
 impl RecordBatchReader for PromotionArrow {
     fn schema(&self) -> SchemaRef {
-        Self::schema_ref()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -127,7 +141,7 @@ impl Iterator for PromotionArrow {
             ));
         }
 
-        let cost_arr = decimal128_15_2_array(p_cost);
+        let cost_arr = decimal_array(p_cost, self.column_type_config.decimal_type, 15);
         let batch = RecordBatch::try_new(
             self.schema(),
             vec![
@@ -182,16 +196,16 @@ impl Iterator for PromotionArrow {
     }
 }
 
-static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(make_schema);
+static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| make_schema(&ColumnTypeConfig::default()));
 
-fn make_schema() -> SchemaRef {
+fn make_schema(config: &ColumnTypeConfig) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("p_promo_sk", DataType::Int32, false),
         Field::new("p_promo_id", DataType::Utf8View, false),
         Field::new("p_start_date_sk", DataType::Int32, true),
         Field::new("p_end_date_sk", DataType::Int32, true),
         Field::new("p_item_sk", DataType::Int32, true),
-        Field::new("p_cost", DataType::Decimal128(15, 2), true),
+        Field::new("p_cost", decimal_arrow_type(config.decimal_type, 15), true),
         Field::new("p_response_target", DataType::Int32, true),
         Field::new("p_promo_name", DataType::Utf8View, true),
         Field::new("p_channel_dmail", DataType::Utf8View, true),
