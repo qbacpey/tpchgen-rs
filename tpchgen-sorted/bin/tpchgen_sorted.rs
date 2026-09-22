@@ -1,11 +1,14 @@
 //! Generates date-clustered, sorted TPC-H tables
 
 use clap::{Parser, ValueEnum};
-use parquet::basic::Compression;
+use parquet::basic::{Compression, Encoding};
 use std::io;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Instant;
+use tpcgen_cli::parquet::ParquetVersion;
 use tpchgen::dates::TPCHDate;
+use tpchgen_arrow::{ColumnTypeConfig, DateColumnType, DecimalColumnType};
 use tpchgen_sorted::verify;
 use tpchgen_sorted::write::{self, LineItems, Options, Orders, Report, Table};
 
@@ -68,6 +71,46 @@ struct Args {
     #[arg(long, value_enum, default_value_t = CompressionArg::Snappy)]
     compression: CompressionArg,
 
+    /// Per-column Parquet encodings, overriding the writer defaults.
+    ///
+    /// Format: COLUMN=ENCODING pairs, comma separated. Encodings naming a
+    /// column the table does not have are ignored. PLAIN_DICTIONARY and
+    /// RLE_DICTIONARY are rejected by the writer: dictionary encoding is the
+    /// writer default and cannot be requested through this flag.
+    ///
+    /// Example: `--column-encoding l_comment=PLAIN,l_orderkey=DELTA_BINARY_PACKED`
+    #[arg(long, value_delimiter = ',', value_parser = parse_column_encoding_pair)]
+    column_encoding: Option<Vec<(String, Encoding)>>,
+
+    /// Disable dictionary encoding for specific columns.
+    ///
+    /// Format: comma separated list of column names.
+    ///
+    /// Example: `--disable-dictionary-encoding=l_comment,l_shipinstruct`
+    #[arg(long = "disable-dictionary-encoding", num_args = 0.., value_delimiter = ',')]
+    disable_dictionary_encoding_columns: Vec<String>,
+
+    /// Parquet format version to write.
+    ///
+    /// Version 1 (default) has broader compatibility. Version 2 uses Data Page
+    /// V2 format with improved encodings.
+    ///
+    /// Valid values: v1 (default), v2
+    #[arg(long, default_value = "v1", value_parser = clap::value_parser!(ParquetVersion))]
+    parquet_version: ParquetVersion,
+
+    /// Type to use for decimal/monetary columns.
+    ///
+    /// Valid values: decimal128 (default), f64
+    #[arg(long, default_value = "decimal128", value_parser = clap::value_parser!(DecimalColumnType))]
+    decimal_column_type: DecimalColumnType,
+
+    /// Type to use for date columns.
+    ///
+    /// Valid values: date32 (default), timestamp_ms
+    #[arg(long, default_value = "date32", value_parser = clap::value_parser!(DateColumnType))]
+    date_column_type: DateColumnType,
+
     /// Print the partition plan and exit
     #[arg(long)]
     plan_only: bool,
@@ -75,6 +118,20 @@ struct Args {
     /// Read the output back and check it against the generator
     #[arg(long)]
     verify: bool,
+}
+
+/// Parses one `COLUMN=ENCODING` pair of `--column-encoding`
+fn parse_column_encoding_pair(s: &str) -> Result<(String, Encoding), String> {
+    let Some((name, encoding)) = s.split_once('=') else {
+        return Err(format!("expected COLUMN=ENCODING, got: '{s}'"));
+    };
+    let name = name.trim();
+    let encoding = encoding.trim();
+    if name.is_empty() || encoding.is_empty() {
+        return Err(format!("expected COLUMN=ENCODING, got: '{s}'"));
+    }
+    let encoding = Encoding::from_str(encoding).map_err(|e| e.to_string())?;
+    Ok((name.to_string(), encoding))
 }
 
 fn main() -> io::Result<()> {
@@ -96,6 +153,15 @@ fn main() -> io::Result<()> {
             CompressionArg::Snappy => Compression::SNAPPY,
             CompressionArg::Zstd => Compression::ZSTD(Default::default()),
             CompressionArg::Uncompressed => Compression::UNCOMPRESSED,
+        },
+        column_encodings: args.column_encoding,
+        uncompressed_column_overrides: Vec::new(),
+        disable_dictionary_encoding_columns: args.disable_dictionary_encoding_columns,
+        parquet_version: args.parquet_version,
+        column_types: ColumnTypeConfig {
+            decimal_type: args.decimal_column_type,
+            date_type: args.date_column_type,
+            ..Default::default()
         },
         plan_only: args.plan_only,
     };

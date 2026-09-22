@@ -213,6 +213,7 @@ where
                     disable_dictionary_encoding_columns: plan
                         .parquet_disable_dictionary_encoding_columns(),
                     parquet_version: plan.parquet_version(),
+                    sorting_columns: None,
                 },
                 progress,
             )
@@ -239,6 +240,7 @@ where
                     disable_dictionary_encoding_columns: plan
                         .parquet_disable_dictionary_encoding_columns(),
                     parquet_version: plan.parquet_version(),
+                    sorting_columns: None,
                 },
                 progress,
             )

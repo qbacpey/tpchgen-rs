@@ -1,29 +1,40 @@
 //! Fills the planned partitions and writes them as Parquet
+//!
+//! Output goes through [`generate_parquet`], the same parallel column-chunk
+//! encoder `tpcgen-cli` uses, so a sorted dataset differs from the unsorted
+//! baseline only in row order, and each file's row groups are encoded across
+//! all worker threads.
 
 use crate::histogram::{self, day_index, DayHistogram};
 use crate::layout::{self, Partition};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use arrow::record_batch::RecordBatchReader;
+use parquet::basic::{Compression, Encoding};
+use parquet::file::metadata::SortingColumn;
 use std::fs::File;
-use std::io;
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tpcgen_cli::parquet::{generate_parquet, ParquetVersion, WriterPropertyOptions};
+use tpcgen_cli::progress::ProgressHandle;
 use tpchgen::dates::TPCHDate;
 use tpchgen::generators::{
     LineItem, LineItemGenerator, LineItemShipDateRangeIterator, Order, OrderDateRangeIterator,
     OrderGenerator,
 };
-use tpchgen_arrow::{lineitem_batch, order_batch, LineItemArrow, OrderArrow};
+use tpchgen_arrow::{lineitem_batch, order_batch, ColumnTypeConfig, LineItemArrow, OrderArrow};
 
 /// A table that can be generated clustered on a date column
-pub trait SortedTable {
+///
+/// The `'static` bound lets row groups own their rows: `generate_parquet`
+/// encodes each row group on its own task.
+pub trait SortedTable: 'static {
     /// The row type the generator produces
-    type Row: Send + Sync + Clone;
+    type Row: Send + Sync + Clone + 'static;
     /// The iterator that produces the rows of one key-space chunk that fall in
     /// a date range
     type Rows: Iterator<Item = Self::Row>;
@@ -34,6 +45,10 @@ pub trait SortedTable {
     const SORT_KEY: &'static str;
     /// The column the output is sorted on within a date
     const SECONDARY_KEY: &'static str;
+    /// Parquet column index of `SORT_KEY`
+    const SORT_KEY_COLUMN: i32;
+    /// Parquet column index of `SECONDARY_KEY`
+    const SECONDARY_KEY_COLUMN: i32;
     /// Average Parquet bytes per row, used to size row groups. Matches the
     /// estimates `tpcgen-cli` uses for its own row group sizing.
     const PARQUET_BYTES_PER_ROW: u64;
@@ -54,11 +69,33 @@ pub trait SortedTable {
     /// The day histogram index of a row's sort key
     fn day(row: &Self::Row) -> usize;
 
-    /// The Arrow schema of the output
-    fn schema() -> SchemaRef;
+    /// The Arrow schema of the output for a column type configuration
+    fn schema_for(config: &ColumnTypeConfig) -> SchemaRef;
 
     /// Converts rows to a [`RecordBatch`]
-    fn batch(schema: &SchemaRef, rows: &[Self::Row]) -> Result<RecordBatch, ArrowError>;
+    fn batch(
+        schema: &SchemaRef,
+        config: &ColumnTypeConfig,
+        rows: &[Self::Row],
+    ) -> Result<RecordBatch, ArrowError>;
+
+    /// The sort order declared in the Parquet file metadata: ascending on the
+    /// date, then the key. The columns are not nullable, so `nulls_first` is
+    /// irrelevant.
+    fn sorting_columns() -> [SortingColumn; 2] {
+        [
+            SortingColumn {
+                column_idx: Self::SORT_KEY_COLUMN,
+                descending: false,
+                nulls_first: false,
+            },
+            SortingColumn {
+                column_idx: Self::SECONDARY_KEY_COLUMN,
+                descending: false,
+                nulls_first: false,
+            },
+        ]
+    }
 }
 
 /// The `orders` table, clustered on `o_orderdate`
@@ -71,6 +108,8 @@ impl SortedTable for Orders {
     const NAME: &'static str = "orders";
     const SORT_KEY: &'static str = "o_orderdate";
     const SECONDARY_KEY: &'static str = "o_orderkey";
+    const SORT_KEY_COLUMN: i32 = 4;
+    const SECONDARY_KEY_COLUMN: i32 = 0;
     const PARQUET_BYTES_PER_ROW: u64 = 75;
 
     fn histogram(scale_factor: f64, chunks: usize) -> DayHistogram {
@@ -93,12 +132,16 @@ impl SortedTable for Orders {
         row.o_orderdate.into_inner() as usize
     }
 
-    fn schema() -> SchemaRef {
-        OrderArrow::schema_ref()
+    fn schema_for(config: &ColumnTypeConfig) -> SchemaRef {
+        OrderArrow::schema_for(config)
     }
 
-    fn batch(schema: &SchemaRef, rows: &[Self::Row]) -> Result<RecordBatch, ArrowError> {
-        order_batch(schema, &Default::default(), rows)
+    fn batch(
+        schema: &SchemaRef,
+        config: &ColumnTypeConfig,
+        rows: &[Self::Row],
+    ) -> Result<RecordBatch, ArrowError> {
+        order_batch(schema, config, rows)
     }
 }
 
@@ -112,6 +155,8 @@ impl SortedTable for LineItems {
     const NAME: &'static str = "lineitem";
     const SORT_KEY: &'static str = "l_shipdate";
     const SECONDARY_KEY: &'static str = "l_orderkey";
+    const SORT_KEY_COLUMN: i32 = 10;
+    const SECONDARY_KEY_COLUMN: i32 = 0;
     const PARQUET_BYTES_PER_ROW: u64 = 64;
 
     fn histogram(scale_factor: f64, chunks: usize) -> DayHistogram {
@@ -134,12 +179,16 @@ impl SortedTable for LineItems {
         row.l_shipdate.into_inner() as usize
     }
 
-    fn schema() -> SchemaRef {
-        LineItemArrow::schema_ref()
+    fn schema_for(config: &ColumnTypeConfig) -> SchemaRef {
+        LineItemArrow::schema_for(config)
     }
 
-    fn batch(schema: &SchemaRef, rows: &[Self::Row]) -> Result<RecordBatch, ArrowError> {
-        lineitem_batch(schema, &Default::default(), rows)
+    fn batch(
+        schema: &SchemaRef,
+        config: &ColumnTypeConfig,
+        rows: &[Self::Row],
+    ) -> Result<RecordBatch, ArrowError> {
+        lineitem_batch(schema, config, rows)
     }
 }
 
@@ -175,6 +224,16 @@ pub struct Options {
     /// Rows converted to Arrow at a time
     pub batch_rows: usize,
     pub compression: Compression,
+    /// Per-column Parquet encodings (overrides writer defaults)
+    pub column_encodings: Option<Vec<(String, Encoding)>>,
+    /// Columns that should use UNCOMPRESSED block compression
+    pub uncompressed_column_overrides: Vec<String>,
+    /// Columns that should not use dictionary encoding
+    pub disable_dictionary_encoding_columns: Vec<String>,
+    /// Parquet format version to write
+    pub parquet_version: ParquetVersion,
+    /// Arrow types for the decimal and date columns
+    pub column_types: ColumnTypeConfig,
     /// Print the plan without writing any data
     pub plan_only: bool,
 }
@@ -222,7 +281,27 @@ pub fn generate<T: SortedTable>(options: &Options) -> io::Result<Report> {
     }
 
     std::fs::create_dir_all(&table_dir)?;
-    let schema = T::schema();
+    let schema = T::schema_for(&options.column_types);
+    let sorting_columns = T::sorting_columns();
+    let column_encodings = options
+        .column_encodings
+        .as_deref()
+        .map(|encodings| column_encodings_for_schema(&schema, encodings));
+    let properties = WriterPropertyOptions {
+        compression: options.compression,
+        column_encodings: column_encodings.as_deref(),
+        uncompressed_column_overrides: &options.uncompressed_column_overrides,
+        disable_dictionary_encoding_columns: &options.disable_dictionary_encoding_columns,
+        parquet_version: options.parquet_version,
+        sorting_columns: Some(&sorting_columns),
+    };
+
+    // generate_parquet is async. One runtime drives every partition's write;
+    // each write in turn encodes its row groups across all worker threads.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(chunks)
+        .enable_all()
+        .build()?;
 
     let fill_start = Instant::now();
     let mut bytes = 0u64;
@@ -233,7 +312,7 @@ pub fn generate<T: SortedTable>(options: &Options) -> io::Result<Report> {
         // One sweep of the key space per chunk, bucketing by day. Chunks cover
         // ascending key ranges, so concatenating a day's buckets in chunk order
         // yields the rows of that day in key order.
-        let buckets: Vec<Vec<Vec<T::Row>>> = thread::scope(|scope| {
+        let mut buckets: Vec<Vec<Vec<T::Row>>> = thread::scope(|scope| {
             let handles: Vec<_> = (1..=chunks)
                 .map(|chunk| {
                     let histogram = &histogram;
@@ -255,26 +334,24 @@ pub fn generate<T: SortedTable>(options: &Options) -> io::Result<Report> {
                 .collect()
         });
 
-        let written = thread::scope(|scope| {
-            let handles: Vec<_> = group
-                .iter()
-                .map(|partition| {
-                    let buckets = &buckets;
-                    let schema = &schema;
-                    let table_dir = table_dir.as_path();
-                    scope.spawn(move || {
-                        write_partition::<T>(
-                            partition, buckets, first_day, schema, table_dir, options,
-                        )
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("writer thread panicked"))
-                .collect::<io::Result<Vec<u64>>>()
-        })?;
-        bytes += written.iter().sum::<u64>();
+        // Partitions own disjoint day ranges, so each moves its rows out of
+        // the shared buckets without touching another partition's.
+        let mut prepared = Vec::with_capacity(group.len());
+        for partition in group {
+            prepared.push(prepare_partition::<T>(
+                partition,
+                &mut buckets,
+                first_day,
+                &schema,
+                &table_dir,
+                options,
+            )?);
+        }
+        // Then write them concurrently: every generate_parquet call shares the
+        // runtime's worker pool, so the encode tasks of all partitions in the
+        // pass interleave and keep every core busy even when one file has
+        // fewer row groups than threads.
+        bytes += runtime.block_on(write_prepared::<T>(prepared, chunks, properties))?;
     }
     let fill_time = fill_start.elapsed();
 
@@ -296,6 +373,21 @@ pub fn generate<T: SortedTable>(options: &Options) -> io::Result<Report> {
         fill_time,
         passes: pass_count,
     })
+}
+
+/// Keeps only the encodings whose column exists in `schema`
+///
+/// `tpcgen-cli` applies the same filter per table; this crate writes one
+/// table per run, so the schema is the whole filter.
+fn column_encodings_for_schema(
+    schema: &SchemaRef,
+    encodings: &[(String, Encoding)],
+) -> Vec<(String, Encoding)> {
+    encodings
+        .iter()
+        .filter(|(column, _)| schema.fields().iter().any(|f| f.name() == column))
+        .cloned()
+        .collect()
 }
 
 /// Generates one chunk of the key space, bucketing rows by day
@@ -321,74 +413,164 @@ fn bucket_chunk<T: SortedTable>(
     buckets
 }
 
-/// Writes one partition, reading its days out of the per-chunk buckets in
-/// order
-fn write_partition<T: SortedTable>(
+/// A partition ready to write: its path and its owned row-group readers
+type Prepared<T> = (PathBuf, Vec<RowGroup<T>>);
+
+/// Moves one partition's rows out of the per-chunk buckets and regroups them
+/// into owned, row-group-sized readers, each becoming one Parquet row group
+fn prepare_partition<T: SortedTable>(
     partition: &Partition,
-    buckets: &[Vec<Vec<T::Row>>],
+    buckets: &mut [Vec<Vec<T::Row>>],
     pass_first_day: i32,
     schema: &SchemaRef,
     table_dir: &Path,
     options: &Options,
-) -> io::Result<u64> {
+) -> io::Result<Prepared<T>> {
     // Even row groups: the exact row count is known, so the last row group does
     // not have to be a small remainder.
     let target_rows = (options.row_group_bytes / T::PARQUET_BYTES_PER_ROW).max(1);
     let row_groups = partition.rows.div_ceil(target_rows).max(1);
-    let row_group_rows = partition.rows.div_ceil(row_groups);
-
-    let properties = WriterProperties::builder()
-        .set_compression(options.compression)
-        .set_max_row_group_row_count(Some(row_group_rows as usize))
-        .build();
+    let row_group_rows = partition.rows.div_ceil(row_groups) as usize;
 
     let path = table_dir.join(format!("{}.{}.parquet", T::NAME, partition.number));
-    let file = File::create(&path)?;
-    let mut writer =
-        ArrowWriter::try_new(file, schema.clone(), Some(properties)).map_err(io::Error::other)?;
-
-    let offset = day_index(pass_first_day);
-    let mut pending: Vec<T::Row> = Vec::with_capacity(options.batch_rows);
-    let mut rows = 0u64;
-    for day in day_index(partition.first_day)..=day_index(partition.last_day) {
-        for chunk in buckets {
-            let segment = &chunk[day - offset];
-            for slice in segment.chunks(options.batch_rows) {
-                if pending.len() + slice.len() > options.batch_rows && !pending.is_empty() {
-                    rows += flush::<T>(&mut writer, schema, &mut pending)?;
-                }
-                pending.extend_from_slice(slice);
-                if pending.len() >= options.batch_rows {
-                    rows += flush::<T>(&mut writer, schema, &mut pending)?;
-                }
-            }
-        }
-    }
-    rows += flush::<T>(&mut writer, schema, &mut pending)?;
-
-    writer.close().map_err(io::Error::other)?;
+    let groups = take_row_groups::<T>(partition, buckets, pass_first_day, row_group_rows);
+    let rows: u64 = groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|segment| segment.len() as u64)
+                .sum::<u64>()
+        })
+        .sum();
     if rows != partition.rows {
         return Err(io::Error::other(format!(
-            "{}: wrote {rows} rows, planned {}",
+            "{}: collected {rows} rows, planned {}",
             path.display(),
             partition.rows
         )));
     }
 
-    Ok(std::fs::metadata(&path)?.len())
+    let readers = groups
+        .into_iter()
+        .map(|segments| RowGroup {
+            schema: schema.clone(),
+            config: options.column_types,
+            segments,
+            segment: 0,
+            offset: 0,
+            pending: Vec::with_capacity(options.batch_rows),
+        })
+        .collect();
+    Ok((path, readers))
 }
 
-fn flush<T: SortedTable>(
-    writer: &mut ArrowWriter<File>,
-    schema: &SchemaRef,
-    pending: &mut Vec<T::Row>,
+/// Writes every prepared partition of a pass concurrently
+///
+/// Each file gets its own [`generate_parquet`] call; the calls share the
+/// runtime's worker pool, so row-group encoding stays parallel across the
+/// whole pass rather than ramping up and draining once per file.
+async fn write_prepared<T: SortedTable>(
+    prepared: Vec<Prepared<T>>,
+    threads: usize,
+    properties: WriterPropertyOptions<'_>,
 ) -> io::Result<u64> {
-    if pending.is_empty() {
-        return Ok(0);
+    let writes = prepared.into_iter().map(|(path, readers)| async move {
+        let file = File::create(&path)?;
+        let writer = BufWriter::with_capacity(32 * 1024 * 1024, file);
+        generate_parquet(
+            writer,
+            readers.into_iter(),
+            threads,
+            properties,
+            ProgressHandle::new(|_| {}),
+        )
+        .await?;
+        Ok(std::fs::metadata(&path)?.len()) as io::Result<u64>
+    });
+    let sizes: Vec<u64> = futures::future::try_join_all(writes).await?;
+    Ok(sizes.into_iter().sum())
+}
+
+/// Moves the rows of one partition out of the per-chunk buckets, grouped into
+/// row-group-sized lists of day segments
+///
+/// Every day belongs to exactly one partition, so the takes never overlap.
+/// Segments move whole, so no row is copied here: a group closes once it
+/// holds at least `row_group_rows` rows, overshooting by less than one
+/// segment.
+fn take_row_groups<T: SortedTable>(
+    partition: &Partition,
+    buckets: &mut [Vec<Vec<T::Row>>],
+    pass_first_day: i32,
+    row_group_rows: usize,
+) -> Vec<Vec<Vec<T::Row>>> {
+    let offset = day_index(pass_first_day);
+    let mut groups = Vec::new();
+    let mut current: Vec<Vec<T::Row>> = Vec::new();
+    let mut current_rows = 0usize;
+    for day in day_index(partition.first_day)..=day_index(partition.last_day) {
+        for chunk in buckets.iter_mut() {
+            let segment = std::mem::take(&mut chunk[day - offset]);
+            current_rows += segment.len();
+            current.push(segment);
+            if current_rows >= row_group_rows {
+                groups.push(std::mem::take(&mut current));
+                current_rows = 0;
+            }
+        }
     }
-    let batch = T::batch(schema, pending).map_err(io::Error::other)?;
-    writer.write(&batch).map_err(io::Error::other)?;
-    let rows = pending.len() as u64;
-    pending.clear();
-    Ok(rows)
+    if current_rows > 0 {
+        groups.push(current);
+    }
+    groups
+}
+
+/// A [`RecordBatchReader`] owning the rows of one row group
+///
+/// [`generate_parquet`] encodes each reader as its own row group on its own
+/// task, so the rows must be owned rather than borrowed from the fill pass's
+/// buckets. They stay in their per-day segments until `next` batches them:
+/// the copy into a contiguous batch buffer then runs on the encode task, in
+/// parallel with the other row groups, instead of serially in the fill pass.
+struct RowGroup<T: SortedTable> {
+    schema: SchemaRef,
+    config: ColumnTypeConfig,
+    /// Rows as per-chunk, per-day segments, in (day, chunk) order
+    segments: Vec<Vec<T::Row>>,
+    /// Current segment and the offset into it
+    segment: usize,
+    offset: usize,
+    /// Scratch space batches are assembled in
+    pending: Vec<T::Row>,
+}
+
+impl<T: SortedTable> Iterator for RowGroup<T> {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch_rows = self.pending.capacity();
+        self.pending.clear();
+        while self.pending.len() < batch_rows && self.segment < self.segments.len() {
+            let segment = &self.segments[self.segment];
+            let take = (batch_rows - self.pending.len()).min(segment.len() - self.offset);
+            self.pending
+                .extend_from_slice(&segment[self.offset..self.offset + take]);
+            self.offset += take;
+            if self.offset == segment.len() {
+                self.segment += 1;
+                self.offset = 0;
+            }
+        }
+        if self.pending.is_empty() {
+            return None;
+        }
+        Some(T::batch(&self.schema, &self.config, &self.pending))
+    }
+}
+
+impl<T: SortedTable> RecordBatchReader for RowGroup<T> {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }

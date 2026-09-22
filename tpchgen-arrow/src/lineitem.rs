@@ -66,6 +66,15 @@ impl LineItemArrow {
         Arc::clone(&LINEITEM_SCHEMA)
     }
 
+    /// Return the schema for `config` without initializing a data generator.
+    pub fn schema_for(config: &ColumnTypeConfig) -> SchemaRef {
+        if config == &ColumnTypeConfig::default() {
+            Arc::clone(&LINEITEM_SCHEMA)
+        } else {
+            make_lineitem_schema(config)
+        }
+    }
+
     pub fn new(generator: LineItemGenerator<'static>) -> Self {
         Self {
             inner: generator.iter(),

@@ -20,7 +20,10 @@ path = "bin/tpchgen_sorted.rs"
 [dependencies]
 arrow = "59"
 clap = { version = "4.5.32", features = ["derive"] }
+futures = "0.3.31"
 parquet = "59"
+tokio = { version = "1.44.1", features = ["rt-multi-thread"] }
+tpcgen-cli = { path = "../tpcgen-cli", default-features = false }
 tpchgen = { path = "../tpchgen", version = "3.0.0" }
 tpchgen-arrow = { path = "../tpchgen-arrow", version = "3.0.0" }
 

@@ -42,7 +42,9 @@ a multiplication rather than a full row.
   convert a row slice to a `RecordBatch`, for callers that buffer rows.
 - `tpchgen-sorted/src/histogram.rs` — key-only scans and per-chunk day counts.
 - `tpchgen-sorted/src/layout.rs` — day histogram to equal-row partitions.
-- `tpchgen-sorted/src/write.rs` — bucketed fill and Parquet output.
+- `tpchgen-sorted/src/write.rs` — bucketed fill and Parquet output through
+  `tpcgen-cli`'s `generate_parquet` (same writer and flags as the unsorted
+  baseline; row groups of a pass encode concurrently on one tokio runtime).
 - `tpchgen-sorted/src/verify.rs` — reads output back, checks sortedness and
   compares a fingerprint derived independently from the random streams.
 - `tpchgen-sorted/examples/walkthrough.rs` — prints every step for 15 rows.
@@ -60,35 +62,30 @@ a multiplication rather than a full row.
 - Any pass count must produce byte-identical files, as
   `multiple_passes_produce_the_same_dataset` asserts.
 
-## Measured, SF10 `lineitem`, 24 cores, Snappy
+## Measured, SF10 `lineitem`, 24 cores, Snappy, 48 files on both sides
+
+Both sides now write through `tpcgen-cli`'s `generate_parquet` with the same
+flags, so the datasets differ only in row order.
 
 | | |
 |---|---|
-| sorted, 48 files, 1 sweep | 5.48 s |
-| sorted, 48 files, 6 sweeps (one sixth the memory) | 6.72 s |
-| unsorted `tpcgen-cli`, 8 files | 4.27 s |
-| #385 path, floor: generate + 8 reads | ≥ 18.5 s |
+| sorted, 48 files, 6 sweeps (one sixth the memory) | 5.37 s |
+| sorted, 48 files, 1 sweep | 5.71 s |
+| unsorted `tpcgen-cli`, 48 files | 4.77 s |
+| #385 path, floor: generate + 48 reads | ≥ 168 s |
 
-`orders` is faster sorted (1.70 s) than unsorted (1.83 s). Key-only scans run at
-1.9–2.1 G rows/s; a rejection sweep at ~238 M rows/s. Row group `l_shipdate`
-span drops from 2524 days (528 of 528 row groups unprunable) to 5 days median.
+One sweep is now *slower* than six: the writers already saturate all cores, so
+the extra sweep costs less than the page-cache pressure of holding the whole
+table. `orders` at 48 files: sorted 1.84 s, unsorted 1.48 s — at 15M rows the
+key-only measure pass is a fixed cost the fill phase cannot amortise. Key-only
+scans run at 1.2–1.5 G rows/s. Row group `l_shipdate` span drops from 2526
+days (528 of 528 row groups unprunable) to 4 days median. Every row group
+declares `sorting_columns` on `(date, key)`.
 
 ## Remaining work, in order
 
-1. Write through `tpcgen-cli`'s `generate_parquet` instead of `ArrowWriter`. It
-   takes an iterator of `RecordBatchReader` where each item becomes one row
-   group, which is the shape the per-day buckets already have. This is what
-   makes the output comparable to the harness's normal dataset, and it
-   parallelises per-file encoding, which should close most of the 1.3× gap
-   against unsorted generation.
-2. Plumb the layout flags through: `--column-encoding`,
-   `--disable-dictionary-encoding`, `--parquet-version`,
-   `--decimal-column-type`, `--date-column-type`. `ColumnTypeConfig` currently
-   arrives at `order_batch`/`lineitem_batch` as `Default::default()`.
-3. Set `sorting_columns` in the writer properties so files declare their order.
-4. Re-benchmark sorted against unsorted with both sides through the same writer.
-5. Emit a complete dataset: the other six tables, either via a wrapper around
-   `tpcgen-cli` or by folding this into `tpcgen-cli` as a flag.
+1. Emit a complete dataset: the other six tables, either via a wrapper around
+ `tpcgen-cli` or by folding this into `tpcgen-cli` as a flag.
 
 Not started, and not needed for the POC: resume support, cluster keys other than
 the dates, TPC-DS.

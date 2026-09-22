@@ -7,6 +7,7 @@ use log::debug;
 use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnChunk};
 use parquet::arrow::{add_encoded_arrow_schema_to_metadata, ArrowSchemaConverter};
 use parquet::basic::{Compression, Encoding};
+use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{
     WriterProperties, WriterPropertiesBuilder, WriterVersion, DEFAULT_COERCE_TYPES,
 };
@@ -49,6 +50,8 @@ pub struct WriterPropertyOptions<'a> {
     pub uncompressed_column_overrides: &'a [String],
     pub disable_dictionary_encoding_columns: &'a [String],
     pub parquet_version: ParquetVersion,
+    /// Sort order to declare in the file metadata, as Parquet column indexes
+    pub sorting_columns: Option<&'a [SortingColumn]>,
 }
 
 impl FromStr for ParquetVersion {
@@ -194,6 +197,9 @@ where
     for column in options.disable_dictionary_encoding_columns {
         debug!("Disabling dictionary encoding for column {column}");
         builder = builder.set_column_dictionary_enabled(ColumnPath::from(column.as_str()), false);
+    }
+    if let Some(columns) = options.sorting_columns {
+        builder = builder.set_sorting_columns(Some(columns.to_vec()));
     }
     let mut writer_properties = builder.build();
     // Embed the Arrow schema in the Parquet metadata (as ArrowWriter does) so
@@ -377,6 +383,7 @@ mod tests {
                 uncompressed_column_overrides: &[],
                 disable_dictionary_encoding_columns: &[],
                 parquet_version: ParquetVersion::V1,
+                sorting_columns: None,
             },
             progress,
         )
@@ -405,6 +412,7 @@ mod tests {
                 uncompressed_column_overrides: &[],
                 disable_dictionary_encoding_columns: &[],
                 parquet_version: ParquetVersion::V1,
+                sorting_columns: None,
             },
             progress,
         )
@@ -429,6 +437,7 @@ mod tests {
                 uncompressed_column_overrides: uncompressed_columns,
                 disable_dictionary_encoding_columns: &[],
                 parquet_version: ParquetVersion::V1,
+                sorting_columns: None,
             },
             progress,
         )
@@ -453,6 +462,7 @@ mod tests {
                 uncompressed_column_overrides: &[],
                 disable_dictionary_encoding_columns: disable_dictionary_columns,
                 parquet_version: ParquetVersion::V1,
+                sorting_columns: None,
             },
             progress,
         )
@@ -477,6 +487,7 @@ mod tests {
                 uncompressed_column_overrides: &[],
                 disable_dictionary_encoding_columns: &[],
                 parquet_version,
+                sorting_columns: None,
             },
             progress,
         )

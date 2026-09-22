@@ -640,6 +640,7 @@ impl Parquet {
                 uncompressed_column_overrides: &self.uncompressed_column_overrides,
                 disable_dictionary_encoding_columns: &self.disable_dictionary_encoding_columns,
                 parquet_version: self.parquet_version,
+                sorting_columns: None,
             },
             progress.clone(),
         )

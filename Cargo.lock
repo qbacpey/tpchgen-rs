@@ -1663,8 +1663,11 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "clap",
+ "futures",
  "parquet",
  "tempfile",
+ "tokio",
+ "tpcgen-cli",
  "tpchgen",
  "tpchgen-arrow",
 ]
