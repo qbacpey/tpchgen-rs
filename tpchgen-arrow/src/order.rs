@@ -64,6 +64,15 @@ impl OrderArrow {
         Arc::clone(&ORDER_SCHEMA)
     }
 
+    /// Return the schema for `config` without initializing a data generator.
+    pub fn schema_for(config: &ColumnTypeConfig) -> SchemaRef {
+        if config == &ColumnTypeConfig::default() {
+            Arc::clone(&ORDER_SCHEMA)
+        } else {
+            make_order_schema(config)
+        }
+    }
+
     pub fn new(generator: OrderGenerator<'static>) -> Self {
         Self {
             inner: generator.iter(),

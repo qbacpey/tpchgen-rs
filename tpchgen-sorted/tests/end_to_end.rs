@@ -2,6 +2,8 @@
 
 use parquet::basic::Compression;
 use std::path::Path;
+use tpcgen_cli::parquet::ParquetVersion;
+use tpchgen_arrow::ColumnTypeConfig;
 use tpchgen_sorted::verify::{self, Fingerprint};
 use tpchgen_sorted::write::{self, LineItems, Options, Orders, Report, SortedTable, Table};
 
@@ -15,6 +17,11 @@ fn options(output_dir: &Path, files: usize, files_per_pass: usize) -> Options {
         row_group_bytes: 64 * 1024,
         batch_rows: 1024,
         compression: Compression::UNCOMPRESSED,
+        column_encodings: None,
+        uncompressed_column_overrides: Vec::new(),
+        disable_dictionary_encoding_columns: Vec::new(),
+        parquet_version: ParquetVersion::V1,
+        column_types: ColumnTypeConfig::default(),
         plan_only: false,
     }
 }

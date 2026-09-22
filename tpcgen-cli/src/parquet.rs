@@ -7,6 +7,7 @@ use log::debug;
 use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnChunk};
 use parquet::arrow::{add_encoded_arrow_schema_to_metadata, ArrowSchemaConverter};
 use parquet::basic::{Compression, Encoding};
+use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{
     WriterProperties, WriterPropertiesBuilder, WriterVersion, DEFAULT_COERCE_TYPES,
 };
@@ -149,6 +150,8 @@ pub async fn generate_parquet<W, I>(
     uncompressed_column_overrides: &[String],
     disable_dictionary_encoding_columns: &[String],
     parquet_version: ParquetVersion,
+    // Sort order to declare in the file metadata, as Parquet column indexes
+    sorting_columns: Option<&[SortingColumn]>,
     progress: ProgressHandle,
 ) -> Result<(), io::Error>
 where
@@ -188,6 +191,9 @@ where
     for column in disable_dictionary_encoding_columns {
         debug!("Disabling dictionary encoding for column {column}");
         builder = builder.set_column_dictionary_enabled(ColumnPath::from(column.as_str()), false);
+    }
+    if let Some(columns) = sorting_columns {
+        builder = builder.set_sorting_columns(Some(columns.to_vec()));
     }
     let mut writer_properties = builder.build();
     // Embed the Arrow schema in the Parquet metadata (as ArrowWriter does) so
@@ -370,6 +376,7 @@ mod tests {
             &[],
             &[],
             ParquetVersion::V1,
+            None,
             progress,
         )
         .await
@@ -396,6 +403,7 @@ mod tests {
             &[],
             &[],
             ParquetVersion::V1,
+            None,
             progress,
         )
         .await
@@ -418,6 +426,7 @@ mod tests {
             uncompressed_columns,
             &[],
             ParquetVersion::V1,
+            None,
             progress,
         )
         .await
@@ -440,6 +449,7 @@ mod tests {
             &[],
             disable_dictionary_columns,
             ParquetVersion::V1,
+            None,
             progress,
         )
         .await
@@ -462,6 +472,7 @@ mod tests {
             &[],
             &[],
             parquet_version,
+            None,
             progress,
         )
         .await

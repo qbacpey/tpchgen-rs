@@ -14,7 +14,7 @@
 
 use crate::histogram::day_index;
 use crate::layout::Partition;
-use arrow::array::{Array, Date32Array, Int32Array, Int64Array};
+use arrow::array::{Array, Date32Array, Int32Array, Int64Array, TimestampMillisecondArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use std::fs::File;
@@ -96,6 +96,38 @@ struct Keys {
     line_number: Option<usize>,
 }
 
+/// The sort key column of a projected batch, in either type
+/// `--date-column-type` can write it in
+enum SortKey<'a> {
+    Date32(&'a Date32Array),
+    TimestampMs(&'a TimestampMillisecondArray),
+}
+
+impl<'a> SortKey<'a> {
+    fn new(array: &'a dyn Array) -> io::Result<Self> {
+        if let Some(days) = array.as_any().downcast_ref::<Date32Array>() {
+            Ok(Self::Date32(days))
+        } else if let Some(timestamps) = array.as_any().downcast_ref::<TimestampMillisecondArray>()
+        {
+            Ok(Self::TimestampMs(timestamps))
+        } else {
+            Err(io::Error::other(
+                "sort key is not a Date32 or Timestamp(ms) column",
+            ))
+        }
+    }
+
+    /// The row's day, in generated date units
+    fn day(&self, row: usize) -> i64 {
+        const MILLIS_PER_DAY: i64 = 86_400_000;
+        let epoch_day = match self {
+            Self::Date32(days) => days.value(row) as i64,
+            Self::TimestampMs(timestamps) => timestamps.value(row) / MILLIS_PER_DAY,
+        };
+        epoch_day - TPCHDate::UNIX_EPOCH_OFFSET as i64
+    }
+}
+
 /// `o_orderkey`, `o_orderdate`
 const ORDER_KEYS: Keys = Keys {
     file_columns: &[0, 4],
@@ -139,8 +171,8 @@ pub fn check(
             .build()
             .map_err(io::Error::other)?;
 
-        let first_day = day_index(partition.first_day) as i32;
-        let last_day = day_index(partition.last_day) as i32;
+        let first_day = day_index(partition.first_day) as i64;
+        let last_day = day_index(partition.last_day) as i64;
         if let Some(previous) = previous_last_day {
             if first_day <= previous {
                 return Err(io::Error::other(format!(
@@ -155,11 +187,7 @@ pub fn check(
         let mut previous_row = None;
         for batch in reader {
             let batch = batch.map_err(io::Error::other)?;
-            let days = batch
-                .column(keys.sort_key)
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| io::Error::other("sort key is not a Date32 column"))?;
+            let days = SortKey::new(batch.column(keys.sort_key))?;
             let secondary = batch
                 .column(keys.secondary_key)
                 .as_any()
@@ -177,7 +205,7 @@ pub fn check(
             };
 
             for row in 0..batch.num_rows() {
-                let day = days.value(row) - TPCHDate::UNIX_EPOCH_OFFSET;
+                let day = days.day(row);
                 let key = secondary.value(row);
                 let line = line_numbers.map_or(0, |numbers| numbers.value(row) as i64);
 
@@ -197,7 +225,7 @@ pub fn check(
                     }
                 }
                 previous_row = Some(current);
-                actual.add(day as i64, key, line);
+                actual.add(day, key, line);
                 rows += 1;
             }
         }
