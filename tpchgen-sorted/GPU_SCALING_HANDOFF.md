@@ -8,23 +8,39 @@
 
 Measure wall-clock generation time of two ways to produce a **date-clustered, sorted TPC-H
 dataset** (`orders` by `(o_orderdate, o_orderkey)`, `lineitem` by `(l_shipdate, l_orderkey)`),
-at **SF100, SF1000, SF3000** (SF10000 optional, SF30000 only with sharding — see "Reality check"):
+at **SF100, SF1000, SF3000**:
+
+- **Approach B (Greg's) is required only at SF100 / SF1000 / SF3000.** Do not run it at larger
+  scales — its cost grows linearly past SF3K and the point is already made.
+- **Approach A (ours)** runs the same three scales; SF10000 is optional if time and disk allow.
+  SF30000 is out of scope for both sides (see "Reality check").
 
 - **Approach A (this branch):** `tpchgen-sorted` — generates sorted output directly on CPU.
-  No reads, no sort, no GPU. Baselines already measured on a 24-core/62GB box:
-  SF10 = 5.37s, SF100 = 48.65s, SF300 = 161.8s (all `--verify`-passing).
+  No reads, no sort, no GPU. Baselines already measured on the reference laptop (config in
+  "Reference numbers" below): SF10 = 5.37s, SF100 = 48.65s, SF300 = 161.8s (all
+  `--verify`-passing).
 - **Approach B (Greg's):** [rapidsai/velox-testing#385](https://github.com/rapidsai/velox-testing/pull/385)
   — rewrites an existing unsorted dataset with pylibcudf in a RAPIDS container: one filtered
   full-table read per output partition (read amplification = file count), GPU sort, write.
 
 Report the results table at the end of this document, with logs preserved.
 
-## Machine requirements
+## Machine requirements — derive from the cluster node, do not hardcode
+
+Both programs should use the node's **maximum hardware capability**. Detect it first:
+
+```bash
+nproc          # CPU cores — both tools use all of them by default; no flag needed
+free -g        # total RAM in GB — drives Approach A's --files-per-pass (see Step 2)
+nvidia-smi     # GPU model + VRAM — drives Approach B's --batch-rows (see Step 3)
+df -h /data    # free disk at the data mount
+```
 
 | | Approach A (ours) | Approach B (Greg's) |
 |---|---|---|
-| GPU | none | 1 NVIDIA GPU + docker + nvidia-container-toolkit |
-| RAM | see config table (≤100 GB for SF≤3K) | GPU RAM bounded by `--batch-rows` (default 15M rows) |
+| CPU | all cores by default (`--threads` exists but should not be set) | host-side CPU used by the container (docker sees all cores by default) |
+| GPU | none | 1 NVIDIA GPU + docker + nvidia-container-toolkit; batch size derived from VRAM (Step 3) |
+| RAM | row-buffer budget derived from `free -g` (Step 2) | not the constraint |
 | Disk | dataset × 1 | dataset × 2 (source + output) |
 | Container | none | pulls `rapidsai/base:26.06-cuda13-py3.13` |
 
@@ -67,33 +83,48 @@ count 1:1, so this also fixes its output at 48 files.)
 
 ## Step 2 — Approach A: sorted generation (CPU)
 
-Config rule: peak memory ≈ `rows_per_pass × ~250B + ~4GB`, where
-`rows_per_pass = 6M × SF × files_per_pass / 48`. More files-per-pass = fewer sweeps = faster,
-if RAM allows. Verified-measured configs:
+**Threads:** the tool defaults to all cores (`nproc`); do not pass `--threads`.
 
-| SF | `-f` | `--files-per-pass` | Sweeps | Est. peak RSS | Est. lineitem time |
-|---|---|---|---|---|---|
-| 100 | 48 | 8 | 6 | 27 GB (measured) | ~49 s (measured) |
-| 1000 | 48 | 2 | 24 | ~66 GB | ~20 min |
-| 1000 | 48 | 1 | 48 | ~35 GB | ~30 min |
-| 3000 | 48 | 1 | 48 | ~98 GB | ~90 min |
-| 10000 | 96 | 1 | 96 | ~160 GB | ~8 h (optional) |
+**Memory:** peak RSS ≈ `rows_per_pass × ~250B + ~4 GB`, where
+`rows_per_pass = 6M × SF × files_per_pass / file_count`. More files per pass = fewer sweeps
+= faster, so pick the largest `--files-per-pass` that fits the node's RAM. Derive it:
+
+```
+P = clamp( floor( (0.75 × RAM_GB − 4) / (0.03125 × SF) ), 1, file_count )
+```
+
+(0.75 leaves headroom for the page cache and the OS; 0.03125 GB ≈ one 48-way file's rows at
+SF=1 scaled up — i.e. per-file-per-pass memory is ~3.1 GB at SF100, ~31 GB at SF1K, ~94 GB
+at SF3K.)
+
+Precomputed for common node sizes (`-f 48`):
+
+| Node RAM | SF100 | SF1000 | SF3000 |
+|---|---|---|---|
+| 64 GB | 8 (measured: 27 GB, 49 s) | 1 | 1 — tight (~98 GB); prefer `-f 96`, P=1 (~49 GB) |
+| 128 GB | 16 | 2 | 1 |
+| 256 GB | 24 | 5 | 2 |
+| 512 GB | 48 | 11 | 4 |
+
+If even one file per pass does not fit the 75% budget, **double `-f`** (96, 192, ...) until it
+does — more, smaller files cost more sweeps but keep memory bounded. If the process is
+OOM-killed anyway, halve `--files-per-pass` and rerun (note it in the log).
 
 ```bash
-SF=1000  # repeat per scale factor
+SF=1000  # repeat per scale factor; P from the derivation above
 /usr/bin/time -v ./target/release/tpchgen-sorted \
-  -s $SF -t lineitem -o /data/sorted_sf$SF -f 48 --files-per-pass 2 --verify \
+  -s $SF -t lineitem -o /data/sorted_sf$SF -f 48 --files-per-pass $P --verify \
   2>&1 | tee logs/sorted_lineitem_sf$SF.log
 /usr/bin/time -v ./target/release/tpchgen-sorted \
-  -s $SF -t orders -o /data/sorted_sf$SF -f 48 --files-per-pass 2 --verify \
+  -s $SF -t orders -o /data/sorted_sf$SF -f 48 --files-per-pass $P --verify \
   2>&1 | tee logs/sorted_orders_sf$SF.log
 ```
 
 - **Always keep `--verify`** — it reads the output back and proves sortedness, partition
   disjointness, and completeness against a stream-derived fingerprint. A run that does not
   end in "verified ... complete" is a failed run; capture the log and stop.
-- If the process is OOM-killed, halve `--files-per-pass` and rerun (note it in the log).
 - The tool writes `<output>/<table>/` subdirectories itself.
+- Record the chosen `P` in the results log (node config is recorded once in Step 4).
 
 ## Step 3 — Approach B: GPU rewrite (Greg's #385 scripts)
 
@@ -121,11 +152,17 @@ SF=1000
 
 Notes:
 
+- Run Approach B **only at SF100 / SF1000 / SF3000** — larger scales are not required.
 - `--dry-run` prints the partition plan without writing. `--resume` skips existing files.
 - The wrapper forwards only `--resume`/`--dry-run`. For the identity-rewrite control or a
-  smaller GPU-memory batch, call `sort_partition_table.py` inside the container directly:
+  GPU-memory batch size, call `sort_partition_table.py` inside the container directly:
   `python sort_partition_table.py --source-table ... --output-table ... --identity`
-  or `--batch-rows 5000000`.
+  or `--batch-rows N`.
+- **`--batch-rows` (default 15M) is the GPU-memory knob — size it to the node's VRAM** so the
+  GPU is fully used: each batch materializes ~`batch_rows` rows on device. Rule of thumb:
+  15M rows ≈ safe on 16 GB; raise to 30–60M on 40–80 GB parts (A100/H100), 100M+ on
+  GH200-class. If the container is OOM-killed on the GPU, halve it and rerun.
+- Docker uses all host cores by default; do not add CPU limits to the `docker run`.
 - His partition boundaries are **equal-day**, so `lineitem` output files will be visibly
   unbalanced (sparse ends of the ship-date domain). Expected; not an error.
 - His script verifies row count/schema/codec consistency itself at the end.
@@ -145,6 +182,11 @@ Fill this table (wall = real time from `/usr/bin/time -v`; RSS = Maximum residen
 | 1000 | orders | | | | | | | |
 | 3000 | lineitem | | | | | | | |
 | 3000 | orders | | | | | | | |
+| 10000 (optional, A only) | lineitem | | | | | — | — | — |
+
+Also record the node config once at the top of the results file: `nproc`, `free -g`,
+`nvidia-smi` (model + VRAM), disk size of the data mount, and the `--files-per-pass` /
+`--batch-rows` values chosen.
 
 Plus, per dataset, the pruning-quality stat (run once per sorted output):
 
@@ -172,16 +214,20 @@ Snappy on both sides; keep all `logs/*.log` files.
 
 ## Reality check for SF10K / SF30K
 
-- **SF10K** (60B rows, ~2.6 TiB lineitem): feasible only as `-f 96 --files-per-pass 1`
-  (~160 GB peak, ~8 h). Sweep amplification is the cost: 96 sweeps × ~4 min of key-only
-  rejection each.
-- **SF30K** (180B rows, ~7.8 TiB): **not practical on one node** — one day is ~77M rows
-  (~19 GB, the memory floor, fine) but ~2,345 day-granularity files means ~2,345 sweeps
-  ≈ 20 days of rejection overhead. That scale needs partition-level sharding across
+- **SF10K** (60B rows, ~2.6 TiB lineitem): Approach A only, optional. Feasible as
+  `-f 96 --files-per-pass 1` (~160 GB peak, ~8 h). Sweep amplification is the cost: 96
+  sweeps × ~4 min of key-only rejection each. Do not run Approach B here.
+- **SF30K** (180B rows, ~7.8 TiB): **out of scope for both sides.** Approach A: one day is
+  ~77M rows (~19 GB, the memory floor, fine) but ~2,345 day-granularity files means ~2,345
+  sweeps ≈ 20 days of rejection overhead — that scale needs partition-level sharding across
   runs/machines (day-range shards stitch byte-identically by design), which is **not
-  implemented in this branch** — flag it as future work, don't attempt it by hand.
+  implemented in this branch** — flag it as future work, don't attempt it by hand. Approach B
+  at SF30K would need to read ~7.8 TiB forty-eight times; pointless.
 
-## Reference numbers already measured (24-core / 62 GB CPU-only box)
+## Reference numbers (Qic's laptop)
+
+Hardware: **Intel Core Ultra 9 275HX, 24 cores (24 threads, no SMT, up to 6.5 GHz), 62 GB
+RAM, NVMe SSD, CPU-only** (no GPU involved in any Approach A/B measurement below).
 
 | SF | Unsorted | Sorted (ours) | #385 read floor (48 × full pass) |
 |---|---|---|---|
