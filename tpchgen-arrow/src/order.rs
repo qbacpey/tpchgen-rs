@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchReader;
 use std::sync::{Arc, LazyLock};
-use tpchgen::generators::{OrderGenerator, OrderGeneratorIterator};
+use tpchgen::generators::{Order, OrderGenerator, OrderGeneratorIterator};
 
 /// Generate [`Order`]s in [`RecordBatch`] format
 ///
@@ -64,6 +64,15 @@ impl OrderArrow {
         Arc::clone(&ORDER_SCHEMA)
     }
 
+    /// Return the schema for `config` without initializing a data generator.
+    pub fn schema_for(config: &ColumnTypeConfig) -> SchemaRef {
+        if config == &ColumnTypeConfig::default() {
+            Arc::clone(&ORDER_SCHEMA)
+        } else {
+            make_order_schema(config)
+        }
+    }
+
     pub fn new(generator: OrderGenerator<'static>) -> Self {
         Self {
             inner: generator.iter(),
@@ -107,52 +116,66 @@ impl Iterator for OrderArrow {
             return None;
         }
 
-        let o_orderkey = Int64Array::from_iter_values(rows.iter().map(|r| r.o_orderkey));
-        let o_custkey = Int64Array::from_iter_values(rows.iter().map(|r| r.o_custkey));
-        let o_orderstatus =
-            string_view_array_from_display_iter(rows.iter().map(|r| r.o_orderstatus));
-
-        // Build o_totalprice based on config
-        let o_totalprice: ArrayRef = match self.column_type_config.decimal_type {
-            DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
-                rows.iter().map(|r| r.o_totalprice.as_f64()),
-            )),
-            DecimalColumnType::Decimal128 => Arc::new(decimal128_array_from_iter(
-                rows.iter().map(|r| r.o_totalprice),
-            )),
-        };
-
-        // Build o_orderdate based on config
-        let o_orderdate: ArrayRef = match self.column_type_config.date_type {
-            DateColumnType::Date32 => Arc::new(Date32Array::from_iter_values(
-                rows.iter().map(|r| to_arrow_date32(r.o_orderdate)),
-            )),
-            DateColumnType::TimestampMs => Arc::new(TimestampMillisecondArray::from_iter_values(
-                rows.iter().map(|r| to_arrow_timestamp_ms(r.o_orderdate)),
-            )),
-        };
-
-        let o_orderpriority =
-            StringViewArray::from_iter_values(rows.iter().map(|r| r.o_orderpriority));
-        let o_clerk = string_view_array_from_display_iter(rows.iter().map(|r| r.o_clerk));
-        let o_shippriority = Int32Array::from_iter_values(rows.iter().map(|r| r.o_shippriority));
-        let o_comment = StringViewArray::from_iter_values(rows.iter().map(|r| r.o_comment));
-
-        Some(RecordBatch::try_new(
-            Arc::clone(&self.schema),
-            vec![
-                Arc::new(o_orderkey),
-                Arc::new(o_custkey),
-                Arc::new(o_orderstatus),
-                o_totalprice,
-                o_orderdate,
-                Arc::new(o_orderpriority),
-                Arc::new(o_clerk),
-                Arc::new(o_shippriority),
-                Arc::new(o_comment),
-            ],
-        ))
+        Some(order_batch(&self.schema, &self.column_type_config, &rows))
     }
+}
+
+/// Converts a slice of [`Order`] rows into a [`RecordBatch`]
+///
+/// This is the conversion [`OrderArrow`] applies to the rows it pulls from its
+/// generator, exposed for callers that buffer or reorder rows themselves.
+/// `schema` must describe `config`, as [`OrderArrow::schema_ref`] does for the
+/// default configuration.
+///
+/// [`Order`]: tpchgen::generators::Order
+pub fn order_batch(
+    schema: &SchemaRef,
+    config: &ColumnTypeConfig,
+    rows: &[Order<'_>],
+) -> Result<RecordBatch, ArrowError> {
+    let o_orderkey = Int64Array::from_iter_values(rows.iter().map(|r| r.o_orderkey));
+    let o_custkey = Int64Array::from_iter_values(rows.iter().map(|r| r.o_custkey));
+    let o_orderstatus = string_view_array_from_display_iter(rows.iter().map(|r| r.o_orderstatus));
+
+    // Build o_totalprice based on config
+    let o_totalprice: ArrayRef = match config.decimal_type {
+        DecimalColumnType::F64 => Arc::new(Float64Array::from_iter_values(
+            rows.iter().map(|r| r.o_totalprice.as_f64()),
+        )),
+        DecimalColumnType::Decimal128 => Arc::new(decimal128_array_from_iter(
+            rows.iter().map(|r| r.o_totalprice),
+        )),
+    };
+
+    // Build o_orderdate based on config
+    let o_orderdate: ArrayRef = match config.date_type {
+        DateColumnType::Date32 => Arc::new(Date32Array::from_iter_values(
+            rows.iter().map(|r| to_arrow_date32(r.o_orderdate)),
+        )),
+        DateColumnType::TimestampMs => Arc::new(TimestampMillisecondArray::from_iter_values(
+            rows.iter().map(|r| to_arrow_timestamp_ms(r.o_orderdate)),
+        )),
+    };
+
+    let o_orderpriority = StringViewArray::from_iter_values(rows.iter().map(|r| r.o_orderpriority));
+    let o_clerk = string_view_array_from_display_iter(rows.iter().map(|r| r.o_clerk));
+    let o_shippriority = Int32Array::from_iter_values(rows.iter().map(|r| r.o_shippriority));
+    let o_comment = StringViewArray::from_iter_values(rows.iter().map(|r| r.o_comment));
+
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(o_orderkey),
+            Arc::new(o_custkey),
+            Arc::new(o_orderstatus),
+            o_totalprice,
+            o_orderdate,
+            Arc::new(o_orderpriority),
+            Arc::new(o_clerk),
+            Arc::new(o_shippriority),
+            Arc::new(o_comment),
+        ],
+    )
 }
 
 static ORDER_SCHEMA: LazyLock<SchemaRef> =

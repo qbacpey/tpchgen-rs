@@ -1,0 +1,31 @@
+[package]
+name = "tpchgen-sorted"
+version = "0.1.0"
+authors = { workspace = true }
+description = "Generate date-clustered, sorted TPC-H tables without sorting"
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[lib]
+name = "tpchgen_sorted"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tpchgen-sorted"
+path = "bin/tpchgen_sorted.rs"
+
+[dependencies]
+arrow = "59"
+clap = { version = "4.5.32", features = ["derive"] }
+futures = "0.3.31"
+parquet = "59"
+tokio = { version = "1.44.1", features = ["rt-multi-thread"] }
+tpcgen-cli = { path = "../tpcgen-cli", default-features = false }
+tpchgen = { path = "../tpchgen", version = "3.0.0" }
+tpchgen-arrow = { path = "../tpchgen-arrow", version = "3.0.0" }
+
+[dev-dependencies]
+tempfile = "3.20.0"

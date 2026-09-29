@@ -559,6 +559,7 @@ impl Parquet {
             &[],
             &[],
             crate::parquet::ParquetVersion::default(),
+            None,
             progress.clone(),
         )
         .await?;
